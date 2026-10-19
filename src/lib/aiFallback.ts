@@ -1,5 +1,123 @@
 import { AnswerMode, CopilotAnswer, MockTurnFeedback, MockInterviewReport, ResumeAnalysisResult } from './types';
 
+export async function generateOllamaAnswer(
+  prompt: string,
+  mode: AnswerMode = 'general',
+  resumeContext = '',
+  jobDescription = '',
+  modelParam = '',
+  urlParam = ''
+): Promise<CopilotAnswer | null> {
+  const trimmedLower = prompt.trim().toLowerCase();
+  const hasQuestionMarker = /\b(what|how|why|explain|difference|describe|implement|define|tell me|code|solve)\b/i.test(trimmedLower);
+  const isGreetingOnly = /^(hello|hi|hey|good morning|good afternoon|good evening|how are you|can you hear me|am i audible|testing|audio check|thanks|thank you)(\s+(punit|puneet|there|everyone|sir|team))?[.?!]?$/i.test(trimmedLower);
+
+  // Quick bypass for simple greetings/audio checks to allow instant 1ms response
+  if (!hasQuestionMarker && isGreetingOnly) {
+    return null;
+  }
+
+  const baseOllama = urlParam || process.env.OLLAMA_API_URL || 'http://localhost:11434';
+  const ollamaUrl = baseOllama.endsWith('/api/generate') ? baseOllama : `${baseOllama.replace(/\/$/, '')}/api/generate`;
+  
+  // Fast model selection: Use specified model directly without blocking on /api/tags
+  let modelName = modelParam || process.env.OLLAMA_MODEL || 'qwen2.5:3b';
+
+  const systemPrompt = `You are a high-speed, real-time AI interview copilot for a live software engineering interview.
+Mode: ${mode.toUpperCase()}.
+${resumeContext ? `Candidate Background: ${resumeContext}\n` : ''}${jobDescription ? `Target Role: ${jobDescription}\n` : ''}Provide punchy, ultra-concise, technically flawless answers.
+Return pure JSON matching this exact schema:
+{
+  "summary": "1 direct sentence delivering the core answer or concept",
+  "spokenScript": "1-2 natural conversational sentences in first-person engineer voice for speaking out loud",
+  "bullets": ["2-3 punchy bullet points with key mechanisms"],
+  "codeSnippet": {
+    "language": "python/java/typescript/sql",
+    "code": "concise 3-7 line working code snippet or empty string if purely conceptual",
+    "explanation": "1 short sentence",
+    "timeComplexity": "O(...)",
+    "spaceComplexity": "O(...)"
+  },
+  "tradeoffs": ["1 key engineering trade-off"]
+}
+No markdown backticks. Return pure JSON only.`;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    const resp = await fetch(ollamaUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelName,
+        prompt: `${systemPrompt}\n\nCandidate Question: ${prompt}`,
+        stream: false,
+        format: 'json',
+        options: {
+          num_gpu: 99,
+          num_thread: 8,
+          num_ctx: 2048,
+          num_predict: 320,
+          temperature: 0.1
+        },
+        keep_alive: '60m'
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!resp.ok) {
+      console.warn(`[Ollama] HTTP ${resp.status} from ${ollamaUrl}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    if (!data || !data.response) {
+      return null;
+    }
+
+    const cleaned = data.response.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+
+    const answer: CopilotAnswer = {
+      id: 'ans_ollama_' + Math.random().toString(36).substring(2, 9),
+      question: prompt,
+      mode: mode as AnswerMode,
+      summary: parsed.summary || 'Direct technical solution.',
+      spokenScript: parsed.spokenScript || (parsed.summary ? `${parsed.summary}` : undefined),
+      bullets: Array.isArray(parsed.bullets) && parsed.bullets.length > 0
+        ? parsed.bullets.map((b: any) => {
+            if (typeof b === 'string') return b;
+            if (b && typeof b === 'object') {
+              return b.text ? `${b.text}: ${b.architecture || b.mechanism || ''}`.trim() : Object.values(b).filter(v => typeof v === 'string').join(' - ');
+            }
+            return String(b);
+          })
+        : [parsed.summary || 'Direct technical solution.'],
+      codeSnippet: parsed.codeSnippet && parsed.codeSnippet.code ? {
+        language: parsed.codeSnippet.language || 'java',
+        code: parsed.codeSnippet.code,
+        explanation: parsed.codeSnippet.explanation,
+        timeComplexity: parsed.codeSnippet.timeComplexity,
+        spaceComplexity: parsed.codeSnippet.spaceComplexity
+      } : undefined,
+      tradeoffs: Array.isArray(parsed.tradeoffs) 
+        ? parsed.tradeoffs.map((t: any) => typeof t === 'string' ? t : (t.text || Object.values(t).filter(v => typeof v === 'string').join(' - ')))
+        : undefined,
+      starExample: parsed.starExample,
+      timestamp: Date.now()
+    };
+
+    return answer;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Ollama] Local generation unavailable (${msg}). Gracefully falling back to local smart engine.`);
+    return null;
+  }
+}
+
 export function generateSmartCopilotAnswer(prompt: string, mode: AnswerMode = 'general'): CopilotAnswer {
   const p = prompt.toLowerCase();
   const id = 'ans_' + Math.random().toString(36).substring(2, 9);
@@ -1107,12 +1225,41 @@ COMMIT;`
     };
   }
 
+  // Dedicated Array vs ArrayList concept handler
+  if (p.includes('array') && (p.includes('arraylist') || p.includes('array list') || p.includes('difference between array') || p.includes('vs'))) {
+    return {
+      id,
+      question: prompt,
+      mode: 'coding',
+      summary: 'An Array is a fixed-size, contiguous memory structure supporting primitives directly, while an ArrayList is a dynamic, resizable collection wrapper backed by an array.',
+      spokenScript: 'The primary difference is fixed versus dynamic sizing. Arrays have a fixed capacity allocated at creation and hold primitives with zero memory overhead. An ArrayList dynamically resizes when full and integrates with the Collections API, but only stores object references and incurs slight resizing cost.',
+      bullets: [
+        'Sizing: Arrays have fixed capacity determined at creation; ArrayList automatically grows dynamically (typically +50%) when capacity is reached.',
+        'Data Types: Arrays support both primitives (int, char) and objects directly; ArrayList supports only object types via boxing (Integer, Character).',
+        'Memory Efficiency: Arrays are memory-efficient with direct contiguous memory; ArrayList requires extra heap overhead for wrapper objects.',
+        'Operations: Both offer O(1) random access by index; ArrayList provides convenient helper methods (add, remove, contains).'
+      ],
+      codeSnippet: {
+        language: 'java',
+        code: `// 1. Fixed-size primitive Array\nint[] arr = new int[5];\narr[0] = 42;\n\n// 2. Dynamic resizable ArrayList\nList<Integer> list = new ArrayList<>();\nlist.add(42);\nlist.add(99); // Automatically resizes as elements are added`,
+        explanation: 'Use primitive arrays for high-throughput, fixed-size performance; use ArrayList for dynamic business data collections.',
+        timeComplexity: 'O(1) index access for both; O(1) amortized add for ArrayList',
+        spaceComplexity: 'O(N) contiguous memory'
+      },
+      tradeoffs: [
+        'Memory vs Flexibility: Arrays consume minimal memory but cannot grow; ArrayList handles automatic reallocation at the cost of heap overhead.',
+        'Primitives vs Autoboxing: Arrays eliminate heap allocation for primitives, whereas ArrayList incurs autoboxing and pointer chasing.'
+      ],
+      timestamp: Date.now()
+    };
+  }
+
   // -------------------------------------------------------------
   // 20. GENERAL CODING / ALGORITHM PROBLEM (When requested)
   // -------------------------------------------------------------
   const isCodingQuestion = 
     mode === 'coding' && 
-    (p.includes('code') || p.includes('algorithm') || p.includes('leetcode') || p.includes('implement') || p.includes('solve') || p.includes('function') || p.includes('array') || p.includes('sum'));
+    (p.includes('leetcode') || p.includes('two sum') || p.includes('implement a function') || p.includes('solve this problem') || p.includes('write code to'));
 
   if (isCodingQuestion) {
     return {

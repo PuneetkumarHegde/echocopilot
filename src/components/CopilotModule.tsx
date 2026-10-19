@@ -13,6 +13,8 @@ import {
   isAutoAnswerAllowedForMode, formatAudioErrorMessage,
   enumerateAudioInputDevices, calculateAudioLevel
 } from '@/lib/audioPipelineHelper';
+import { normalizeTechnicalSpeech } from '@/lib/speechNormalizer';
+import { startPcmStreamRecorder, PcmStreamRecorder } from '@/lib/wavRecorder';
 import { FloatingCopilotOverlay } from './FloatingCopilotOverlay';
 import { 
   Mic, MicOff, Play, Square, Pause, Sparkles, Clock, 
@@ -25,6 +27,7 @@ interface CopilotModuleProps {
   initialPrompt?: string;
   initialMode?: AnswerMode;
   onClearInitialPrompt?: () => void;
+  floatingOnly?: boolean;
 }
 
 interface IWindow extends Window {
@@ -35,7 +38,8 @@ interface IWindow extends Window {
 export const CopilotModule: React.FC<CopilotModuleProps> = ({
   initialPrompt = '',
   initialMode = 'coding',
-  onClearInitialPrompt
+  onClearInitialPrompt,
+  floatingOnly = false
 }) => {
   // -------------------------------------------------------------
   // 1. Session & Mode State
@@ -47,13 +51,21 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const [sessionTitle, setSessionTitle] = useState('Live Technical Interview');
   const [autoAnswer, setAutoAnswer] = useState(true);
   const [showMeetGuide, setShowMeetGuide] = useState(false);
-  const [isFloatingOpen, setIsFloatingOpen] = useState(false);
+  const [isFloatingOpen, setIsFloatingOpen] = useState(floatingOnly || false);
   const [autoOpenFloating, setAutoOpenFloating] = useState(true);
 
   // -------------------------------------------------------------
   // 2. Audio Source & Feedback Loop Prevention State
   // -------------------------------------------------------------
-  const [audioSourceMode, setAudioSourceMode] = useState<AudioSourceMode>('device_only');
+  const [audioSourceMode, setAudioSourceMode] = useState<AudioSourceMode>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('echocopilot_audio_mode') as AudioSourceMode;
+      if (saved === 'mic_only' || saved === 'device_only' || saved === 'both') {
+        return saved;
+      }
+    }
+    return 'mic_only';
+  });
   const [answerTriggerPolicy, setAnswerTriggerPolicy] = useState<AnswerTriggerPolicy>('meeting_only');
   const [pipelineStatus, setPipelineStatus] = useState<AudioPipelineStatus>('idle');
 
@@ -88,6 +100,21 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [setupNotice, setSetupNotice] = useState<string | null>(null);
   const [sttStatusNotice, setSttStatusNotice] = useState<string | null>(null);
+  const [speechLang, setSpeechLang] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('echocopilot_speech_lang');
+      if (saved) return saved;
+      const browserLang = navigator.language || '';
+      try {
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        if (browserLang.startsWith('en-IN') || tz.includes('Calcutta') || tz.includes('Kolkata') || tz.includes('Asia/Colombo')) {
+          return 'en-IN';
+        }
+      } catch {}
+      return browserLang.startsWith('en') ? browserLang : 'en-US';
+    }
+    return 'en-US';
+  });
 
   // -------------------------------------------------------------
   // 4. References & Lifecycle Cleaners
@@ -100,7 +127,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const micAnimFrameRef = useRef<number | null>(null);
   const tabAnimFrameRef = useRef<number | null>(null);
   const tabMediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const deduplicatorRef = useRef(new QuestionDeduplicator(15000));
+  const deduplicatorRef = useRef(new QuestionDeduplicator(4000));
 
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const transcriptBottomRef = useRef<HTMLDivElement | null>(null);
@@ -108,12 +135,17 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const isSessionActiveRef = useRef(false);
   const isPausedRef = useRef(false);
   const activeSpeakerRef = useRef(activeSpeaker);
-  const audioSourceModeRef = useRef<AudioSourceMode>('device_only');
+  const audioSourceModeRef = useRef<AudioSourceMode>(audioSourceMode);
   const answerTriggerPolicyRef = useRef<AnswerTriggerPolicy>('meeting_only');
   const speechDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastInterimRef = useRef<string>('');
+  const accumulatedSpeechRef = useRef<string>('');
+  const micPcmRecorderRef = useRef<PcmStreamRecorder | null>(null);
+  const tabPcmRecorderRef = useRef<PcmStreamRecorder | null>(null);
 
   // Synchronize Refs
+  const speechLangRef = useRef(speechLang);
+  useEffect(() => { speechLangRef.current = speechLang; }, [speechLang]);
   useEffect(() => { audioSourceModeRef.current = audioSourceMode; }, [audioSourceMode]);
   useEffect(() => { answerTriggerPolicyRef.current = answerTriggerPolicy; }, [answerTriggerPolicy]);
   useEffect(() => { autoAnswerRef.current = autoAnswer; }, [autoAnswer]);
@@ -179,6 +211,9 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           if (prev.some(t => t.id === data.turn.id)) return prev;
           return [...prev, data.turn];
         });
+        setInterimTranscript('');
+      } else if (data.type === 'INTERIM_SPEECH') {
+        setInterimTranscript(data.text || '');
       }
     };
     return () => {
@@ -186,13 +221,45 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     };
   }, []);
 
+  // Auto-start live listening session when mounted in floating mode
+  useEffect(() => {
+    if (floatingOnly && !isSessionActiveRef.current) {
+      const autoTimer = setTimeout(() => {
+        if (!isSessionActiveRef.current) {
+          handleToggleSession();
+        }
+      }, 500);
+      return () => clearTimeout(autoTimer);
+    }
+  }, [floatingOnly]);
+
+  // Pre-warm local Ollama model in background on GPU to eliminate cold-start delay
+  useEffect(() => {
+    try {
+      const ollamaUrl = (typeof window !== 'undefined' && localStorage.getItem('echocopilot_ollama_url')) || 'http://localhost:11434';
+      const model = (typeof window !== 'undefined' && localStorage.getItem('echocopilot_ai_model')) || 'qwen2.5:3b';
+      fetch(`${ollamaUrl.replace(/\/$/, '')}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          prompt: '',
+          options: { num_gpu: 99 },
+          keep_alive: '60m'
+        })
+      }).catch(() => {});
+    } catch {}
+  }, []);
+
   // Enumerate input audio devices (Part 1 - Enumerate & Select Input Device)
   useEffect(() => {
     const refreshDevices = async () => {
       const devices = await enumerateAudioInputDevices();
+      console.log('[CopilotModule] Enumerated audio input devices:', devices);
       setAudioInputDevices(devices);
       // Auto-select first device if none selected
       if (!selectedMicDeviceId && devices.length > 0) {
+        console.log('[CopilotModule] Auto-selected default microphone device:', devices[0]);
         setSelectedMicDeviceId(devices[0].deviceId);
       }
     };
@@ -207,6 +274,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   }, [selectedMicDeviceId]);
 
   const handleSelectMicDevice = async (deviceId: string) => {
+    console.log(`[CopilotModule] handleSelectMicDevice called with deviceId="${deviceId}"`);
     setSelectedMicDeviceId(deviceId);
     if (typeof window !== 'undefined') {
       localStorage.setItem('echocopilot_mic_device_id', deviceId);
@@ -241,6 +309,9 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const audioCtx = new AudioCtx();
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+      }
       micAudioContextRef.current = audioCtx;
 
       const source = audioCtx.createMediaStreamSource(stream);
@@ -252,6 +323,9 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
 
       const updateMeter = () => {
         if (!isPausedRef.current) {
+          if (audioCtx.state === 'suspended') {
+            audioCtx.resume().catch(() => {});
+          }
           analyser.getByteFrequencyData(dataArray);
           const level = calculateAudioLevel(dataArray);
           setMicAudioLevel(level);
@@ -302,6 +376,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   };
 
   const stopAllAudioStreams = () => {
+    console.log('[CopilotModule] stopAllAudioStreams called: stopping tracks, recorders, contexts');
     // 1. Cancel animation frames
     if (micAnimFrameRef.current) {
       cancelAnimationFrame(micAnimFrameRef.current);
@@ -332,13 +407,23 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       tabMediaStreamRef.current = null;
     }
 
-    // 4. Stop MediaRecorder
+    // 4. Stop PCM Stream Recorders
+    if (micPcmRecorderRef.current) {
+      try { micPcmRecorderRef.current.stop(); } catch {}
+      micPcmRecorderRef.current = null;
+    }
+    if (tabPcmRecorderRef.current) {
+      try { tabPcmRecorderRef.current.stop(); } catch {}
+      tabPcmRecorderRef.current = null;
+    }
+
+    // 5. Stop MediaRecorder
     if (tabMediaRecorderRef.current && tabMediaRecorderRef.current.state !== 'inactive') {
       try { tabMediaRecorderRef.current.stop(); } catch {}
       tabMediaRecorderRef.current = null;
     }
 
-    // 5. Stop Speech Recognition
+    // 6. Stop Speech Recognition
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch {}
       recognitionRef.current = null;
@@ -353,8 +438,27 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   };
 
   // -------------------------------------------------------------
-  // 6. Speech-to-Text: Microphone (Web Speech API)
+  // 6. Speech-to-Text: Microphone (Web Speech API) - Live Transition
   // -------------------------------------------------------------
+  const handleSpeechLangChange = (newLang: string) => {
+    setSpeechLang(newLang);
+    speechLangRef.current = newLang;
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('echocopilot_speech_lang', newLang);
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.lang = newLang;
+        recognitionRef.current.stop();
+        setTimeout(() => {
+          if (isSessionActiveRef.current && !isPausedRef.current && recognitionRef.current) {
+            try { recognitionRef.current.start(); } catch {}
+          }
+        }, 150);
+      } catch {}
+    }
+  };
+
   const initSpeechRecognition = () => {
     const win = typeof window !== 'undefined' ? (window as unknown as IWindow) : null;
     const SpeechRec = win?.SpeechRecognition || win?.webkitSpeechRecognition;
@@ -368,7 +472,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       const rec = new SpeechRec();
       rec.continuous = true;
       rec.interimResults = true;
-      rec.lang = 'en-US';
+      rec.lang = speechLangRef.current || 'en-IN';
 
       rec.onstart = () => {
         setIsMicListening(true);
@@ -385,28 +489,46 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           const item = event.results[i];
           if (item.isFinal) {
             const finalSpeech = item[0].transcript.trim();
-            if (finalSpeech) {
-              commitTurnAndAnswer(finalSpeech, 'mic', 'candidate');
-              return;
+            if (finalSpeech && finalSpeech.length >= 2) {
+              const cleanFinal = normalizeTechnicalSpeech(finalSpeech);
+              // Immediately commit finalized turn with zero pause delay!
+              commitTurnAndAnswer(cleanFinal, 'mic', activeSpeakerRef.current || 'interviewer');
+              setInterimTranscript('');
+              lastInterimRef.current = '';
+              accumulatedSpeechRef.current = '';
+
+              // Clear interim on broadcast channel
+              try {
+                if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+                  const bc = new BroadcastChannel('echocopilot_channel');
+                  bc.postMessage({ type: 'INTERIM_SPEECH', text: '' });
+                  bc.close();
+                }
+              } catch {}
             }
           } else {
             interim += item[0].transcript;
           }
         }
 
-        const trimmedInterim = interim.trim();
-        setInterimTranscript(trimmedInterim);
-        lastInterimRef.current = trimmedInterim;
+        const cleanInterim = interim.trim();
+        if (cleanInterim) {
+          const liveInterim = normalizeTechnicalSpeech(cleanInterim);
+          setInterimTranscript(liveInterim);
+          lastInterimRef.current = liveInterim;
 
-        if (speechDebounceTimerRef.current) clearTimeout(speechDebounceTimerRef.current);
-
-        // Auto-commit paused speech after 1.2s silence
-        if (trimmedInterim.length > 3) {
-          speechDebounceTimerRef.current = setTimeout(() => {
-            if (lastInterimRef.current && !isPausedRef.current) {
-              commitTurnAndAnswer(lastInterimRef.current, 'mic', 'candidate');
+          // Broadcast real-time live interim words to floating HUD immediately
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('echocopilot_channel');
+              bc.postMessage({ 
+                type: 'INTERIM_SPEECH', 
+                text: liveInterim, 
+                speaker: activeSpeakerRef.current || 'interviewer' 
+              });
+              bc.close();
             }
-          }, 1200);
+          } catch {}
         }
       };
 
@@ -417,14 +539,37 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           setMicPermissionState('denied');
           setIsMicListening(false);
           setErrorMessage('Microphone access was denied. Please allow microphone permissions in your browser address bar.');
-        } else if (event.error === 'network') {
-          setErrorMessage('Speech recognition network error. Please check your internet connection.');
+        } else if (event.error === 'network' || event.error === 'aborted') {
+          console.log(`[CopilotModule] Browser Web Speech error (${event.error}) -> activating PCM stream recorder fallback`);
+          if (micMediaStreamRef.current && !micPcmRecorderRef.current) {
+            startMicPcmRecorder(micMediaStreamRef.current);
+          }
         }
       };
 
       rec.onend = () => {
+        // If there was uncommitted interim speech when the cycle ended, finalize it cleanly
+        if (lastInterimRef.current && lastInterimRef.current.trim().length >= 3) {
+          const leftover = normalizeTechnicalSpeech(lastInterimRef.current.trim());
+          lastInterimRef.current = '';
+          setInterimTranscript('');
+          commitTurnAndAnswer(leftover, 'mic', activeSpeakerRef.current || 'interviewer');
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('echocopilot_channel');
+              bc.postMessage({ type: 'INTERIM_SPEECH', text: '' });
+              bc.close();
+            }
+          } catch {}
+        }
+
         if (isSessionActiveRef.current && !isPausedRef.current) {
-          try { rec.start(); } catch {}
+          // Restart with short timeout to prevent Chrome/Edge InvalidStateError
+          setTimeout(() => {
+            if (isSessionActiveRef.current && !isPausedRef.current && recognitionRef.current) {
+              try { recognitionRef.current.start(); } catch {}
+            }
+          }, 150);
         } else {
           setIsMicListening(false);
         }
@@ -435,6 +580,166 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       console.error('Failed to create SpeechRecognition:', err);
       setMicPermissionState('unsupported');
       return null;
+    }
+  };
+
+  const startMicPcmRecorder = (micStream: MediaStream) => {
+    if (micPcmRecorderRef.current) {
+      try { micPcmRecorderRef.current.stop(); } catch {}
+      micPcmRecorderRef.current = null;
+    }
+    console.log('[CopilotModule] Initializing Continuous PCM Stream Recorder for Microphone');
+    micPcmRecorderRef.current = startPcmStreamRecorder({
+      stream: micStream,
+      source: 'mic',
+      onAudioLevel: (level) => {
+        setMicAudioLevel(level);
+        if (level > 2) setIsMicReceivingAudio(true);
+      },
+      onAudioChunk: async (blob, source) => {
+        console.log(`[CopilotModule] Microphone PCM speech chunk ready (${blob.size} bytes) -> sending to /api/transcribe`);
+        setInterimTranscript('🎙️ Transcribing speech...');
+        await sendAudioChunkToTranscribe(blob, source);
+      },
+      onError: (err) => console.warn('[CopilotModule] Mic PCM recorder error:', err)
+    });
+  };
+
+  const sendAudioChunkToTranscribe = async (audioBlob: Blob, source: 'mic' | 'meeting') => {
+    if (isPausedRef.current) return;
+
+    try {
+      setPipelineStatus('transcribing');
+      let apiKey = '';
+      let provider = '';
+      if (typeof window !== 'undefined') {
+        apiKey = localStorage.getItem('echocopilot_api_key') || '';
+        provider = localStorage.getItem('echocopilot_ai_provider') || '';
+      }
+
+      const formData = new FormData();
+      formData.append('audio', audioBlob, `${source}_chunk.wav`);
+      formData.append('source', source);
+      if (apiKey) formData.append('apiKey', apiKey);
+      if (provider) formData.append('provider', provider);
+
+      console.log(`[CopilotModule] Posting ${source} audio chunk to /api/transcribe: ${audioBlob.size} bytes`);
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!res.ok) {
+        console.warn('[CopilotModule] /api/transcribe HTTP error:', res.status, res.statusText);
+        setErrorMessage(`Transcription server error (${res.status}). Check server logs.`);
+        setInterimTranscript('');
+        return;
+      }
+
+      const data = await res.json();
+      console.log('[CopilotModule] /api/transcribe response:', {
+        transcript: data.transcript,
+        provider: data.provider,
+        reason: data.reason,
+        metrics: data.metrics,
+        error: data.error
+      });
+
+      if (data && data.transcript) {
+        const clean = normalizeTechnicalSpeech(data.transcript.trim());
+        if (clean.length >= 2) {
+          console.log(`[CopilotModule] Delivering transcript to UI turn: "${clean}" (source: ${source})`);
+          const speaker = source === 'meeting' ? 'interviewer' : (audioSourceModeRef.current === 'mic_only' ? 'interviewer' : 'candidate');
+          commitTurnAndAnswer(clean, source, speaker);
+        } else {
+          setInterimTranscript('');
+        }
+      } else {
+        // Handle empty or error cases so they are visible rather than silently swallowed
+        if (data.error) {
+          console.warn('[CopilotModule] Transcription returned error:', data.error, data.message);
+          setErrorMessage(`Transcription: ${data.message || data.error}`);
+          setInterimTranscript('');
+        } else if (data.metrics && !data.metrics.isAudible) {
+          console.log(`[CopilotModule] Inaudible audio chunk: peak=${data.metrics.maxPeak}, rms=${data.metrics.rms}`);
+          setInterimTranscript('⚠️ Low audio signal — please speak closer to microphone');
+          setTimeout(() => {
+            setInterimTranscript(prev => prev.startsWith('⚠️') ? '' : prev);
+          }, 3000);
+        } else if (data.reason === 'NO_SPEECH_RECOGNIZED') {
+          console.log('[CopilotModule] Whisper STT returned no speech for chunk');
+          setInterimTranscript('ℹ️ Speech detected but words not clear — please repeat');
+          setTimeout(() => {
+            setInterimTranscript(prev => prev.startsWith('ℹ️') ? '' : prev);
+          }, 3000);
+        } else {
+          setInterimTranscript('');
+        }
+      }
+    } catch (err) {
+      console.warn('[CopilotModule] sendAudioChunkToTranscribe error:', err);
+      setErrorMessage('Audio transcription error: ' + (err instanceof Error ? err.message : String(err)));
+      setInterimTranscript('');
+    } finally {
+      if (isSessionActiveRef.current && !isPausedRef.current) {
+        setPipelineStatus('listening');
+      }
+    }
+  };
+
+  const startMicCapture = async () => {
+    try {
+      const audioConstraints: MediaTrackConstraints = selectedMicDeviceId && selectedMicDeviceId !== 'default'
+        ? { deviceId: { exact: selectedMicDeviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        : { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+      console.log('[CopilotModule] Requesting microphone stream. selectedMicDeviceId:', selectedMicDeviceId, 'constraints:', audioConstraints);
+      let micStream: MediaStream;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+      } catch (firstErr) {
+        console.warn('[CopilotModule] Failed with exact constraints, falling back to audio: true', firstErr);
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      micMediaStreamRef.current = micStream;
+      const tracks = micStream.getAudioTracks().map(t => ({
+        id: t.id,
+        label: t.label,
+        enabled: t.enabled,
+        muted: t.muted,
+        readyState: t.readyState
+      }));
+      console.log('[CopilotModule] Microphone stream successfully acquired. Tracks:', tracks);
+      startMicAudioMeter(micStream);
+
+      const isElectron = typeof window !== 'undefined' && (
+        Boolean((window as any).electronAPI?.isElectron) || 
+        /electron/i.test(navigator.userAgent)
+      );
+
+      if (isElectron) {
+        // Inside Electron: Web Speech API has no Google cloud keys; use high-accuracy local PCM WAV stream recorder
+        console.log('[CopilotModule] Running in Electron environment -> using PCM stream recorder');
+        startMicPcmRecorder(micStream);
+      } else {
+        // In Chrome/Edge browser: Use real-time Web Speech API
+        if (!recognitionRef.current) {
+          const rec = initSpeechRecognition();
+          if (rec) {
+            recognitionRef.current = rec;
+            try { rec.start(); } catch {}
+          }
+        }
+        if (!recognitionRef.current) {
+          startMicPcmRecorder(micStream);
+        }
+      }
+
+      setIsMicListening(true);
+      setMicPermissionState('granted');
+      setErrorMessage(null);
+    } catch (err) {
+      console.warn('Microphone open error:', err);
+      setErrorMessage('Could not open microphone: ' + formatAudioErrorMessage(err));
     }
   };
 
@@ -486,10 +791,33 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       setErrorMessage(null);
       startTabAudioMeter(stream);
 
+      // Start continuous PCM WAV stream recorder for meeting audio
+      if (tabPcmRecorderRef.current) {
+        try { tabPcmRecorderRef.current.stop(); } catch {}
+        tabPcmRecorderRef.current = null;
+      }
+      tabPcmRecorderRef.current = startPcmStreamRecorder({
+        stream,
+        source: 'meeting',
+        onAudioLevel: (level) => {
+          setTabAudioLevel(level);
+          if (level > 2) setIsTabReceivingAudio(true);
+        },
+        onAudioChunk: async (blob, source) => {
+          console.log(`[CopilotModule] Meeting Tab PCM speech chunk (${blob.size} bytes) -> transcribing`);
+          await sendAudioChunkToTranscribe(blob, source);
+        },
+        onError: (err) => console.warn('[CopilotModule] Tab PCM recorder error:', err)
+      });
+
       // Listen for user stopping share via native browser notification bar
       stream.getVideoTracks()[0].onended = () => {
         setIsTabAudioActive(false);
         setTabAudioLevel(0);
+        if (tabPcmRecorderRef.current) {
+          try { tabPcmRecorderRef.current.stop(); } catch {}
+          tabPcmRecorderRef.current = null;
+        }
         if (tabMediaRecorderRef.current && tabMediaRecorderRef.current.state !== 'inactive') {
           try { tabMediaRecorderRef.current.stop(); } catch {}
           tabMediaRecorderRef.current = null;
@@ -500,10 +828,17 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       audioTracks[0].onended = () => {
         setIsTabAudioActive(false);
         setTabAudioLevel(0);
+        if (tabPcmRecorderRef.current) {
+          try { tabPcmRecorderRef.current.stop(); } catch {}
+          tabPcmRecorderRef.current = null;
+        }
       };
 
-      // Set up MediaRecorder to stream audio slices to /api/transcribe
-      setupTabMediaRecorder(stream);
+      // PCM Stream recorder handles 16kHz WAV streaming offline cleanly.
+      // MediaRecorder is only used as a fallback if PCM recorder is not available.
+      if (!tabPcmRecorderRef.current) {
+        setupTabMediaRecorder(stream);
+      }
 
     } catch (err: unknown) {
       const msg = formatAudioErrorMessage(err);
@@ -588,11 +923,11 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     }
 
     // Determine logical speaker identity
-    let speaker: 'interviewer' | 'candidate' = speakerHint;
+    let speaker: 'interviewer' | 'candidate' = activeSpeakerRef.current || speakerHint;
     if (source === 'meeting') {
       speaker = 'interviewer'; // Audio from meeting tab is the interviewer!
     } else if (source === 'mic') {
-      speaker = 'candidate';   // Audio from microphone is the candidate!
+      speaker = audioSourceModeRef.current === 'mic_only' ? 'interviewer' : (activeSpeakerRef.current || 'interviewer');
     }
 
     // Create transcript turn
@@ -604,8 +939,26 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       timestamp: Date.now(),
       isFinal: true
     };
+    console.log(`[CopilotModule] commitTurnAndAnswer: turn added to UI state: id=${turn.id}, speaker=${speaker}, source=${source}, text="${trimmed}"`);
 
-    setTranscript(prev => [...prev, turn]);
+    setTranscript(prev => {
+      if (prev.length > 0) {
+        const last = prev[prev.length - 1];
+        if (last) {
+          const lastLower = last.text.toLowerCase().trim();
+          const newLower = trimmed.toLowerCase();
+          if (lastLower === newLower) {
+            return prev;
+          }
+          if (Date.now() - last.timestamp < 4000 && newLower.startsWith(lastLower) && last.speaker === speaker) {
+            const updated = [...prev];
+            updated[updated.length - 1] = { ...last, text: trimmed, timestamp: Date.now() };
+            return updated;
+          }
+        }
+      }
+      return [...prev, turn];
+    });
     setInterimTranscript('');
     setManualInput(trimmed);
     lastInterimRef.current = '';
@@ -649,17 +1002,52 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     const query = (promptText || manualInput).trim();
     if (!query) return;
 
+    // If manual query (not from speech committer), add turn to transcript feed
+    if (promptText) {
+      setTranscript(prev => {
+        const last = prev[prev.length - 1];
+        if (last && last.text.toLowerCase().trim() === query.toLowerCase()) {
+          return prev;
+        }
+        const manualTurn: TranscriptTurn = {
+          id: 'turn_manual_' + Date.now(),
+          speaker: 'interviewer',
+          source: 'manual',
+          text: query,
+          timestamp: Date.now(),
+          isFinal: true,
+          triggeredAnswer: true
+        };
+        return [...prev, manualTurn];
+      });
+    }
+
     setIsLoadingAnswer(true);
     setErrorMessage(null);
     setPipelineStatus('generating_answer');
 
     try {
+      let provider = 'ollama';
+      let apiKey = '';
+      let model = 'qwen2.5:3b';
+      let ollamaUrl = 'http://localhost:11434';
+      if (typeof window !== 'undefined') {
+        provider = localStorage.getItem('echocopilot_ai_provider') || 'ollama';
+        apiKey = localStorage.getItem('echocopilot_api_key') || '';
+        model = localStorage.getItem('echocopilot_ai_model') || 'qwen2.5:3b';
+        ollamaUrl = localStorage.getItem('echocopilot_ollama_url') || 'http://localhost:11434';
+      }
+
       const resp = await fetch('/api/copilot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: query,
-          mode: currentMode
+          mode: currentMode,
+          provider,
+          apiKey,
+          model,
+          ollamaUrl
         })
       });
 
@@ -714,6 +1102,22 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       setErrorMessage(null);
       setPipelineStatus('listening');
 
+      // Keep Ollama hot on GPU
+      try {
+        const ollamaUrl = (typeof window !== 'undefined' && localStorage.getItem('echocopilot_ollama_url')) || 'http://localhost:11434';
+        const model = (typeof window !== 'undefined' && localStorage.getItem('echocopilot_ai_model')) || 'qwen2.5:3b';
+        fetch(`${ollamaUrl.replace(/\/$/, '')}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            prompt: '',
+            options: { num_gpu: 99 },
+            keep_alive: '60m'
+          })
+        }).catch(() => {});
+      } catch {}
+
       if (autoOpenFloating) {
         setIsFloatingOpen(true);
       }
@@ -721,27 +1125,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       // Initialize based on selected Audio Source Mode
       if (audioSourceMode === 'mic_only') {
         // 1. Microphone Only (Candidate Speech)
-        try {
-          const audioConstraints: MediaTrackConstraints = selectedMicDeviceId && selectedMicDeviceId !== 'default'
-            ? { deviceId: { exact: selectedMicDeviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-            : { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
-          let micStream: MediaStream;
-          try {
-            micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-          } catch {
-            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          }
-          micMediaStreamRef.current = micStream;
-          startMicAudioMeter(micStream);
-        } catch (err) {
-          setErrorMessage('Could not open microphone: ' + formatAudioErrorMessage(err));
-        }
-
-        const rec = initSpeechRecognition();
-        if (rec) {
-          recognitionRef.current = rec;
-          try { rec.start(); } catch {}
-        }
+        await startMicCapture();
 
       } else if (audioSourceMode === 'device_only') {
         // 2. Device Audio Only (Interviewer Meeting Speech)
@@ -751,29 +1135,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
 
       } else if (audioSourceMode === 'both') {
         // 3. Both Microphone + Device Audio simultaneously
-        try {
-          const audioConstraints: MediaTrackConstraints = selectedMicDeviceId && selectedMicDeviceId !== 'default'
-            ? { deviceId: { exact: selectedMicDeviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-            : { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
-          let micStream: MediaStream;
-          try {
-            micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-          } catch {
-            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          }
-          micMediaStreamRef.current = micStream;
-          startMicAudioMeter(micStream);
-        } catch (err) {
-          console.warn('Microphone error in Both mode:', err);
-          setErrorMessage('Microphone capture error in Both mode: ' + formatAudioErrorMessage(err));
-        }
-
-        const rec = initSpeechRecognition();
-        if (rec) {
-          recognitionRef.current = rec;
-          try { rec.start(); } catch {}
-        }
-
+        await startMicCapture();
         if (!isTabAudioActive) {
           await handleCaptureTabAudio();
         }
@@ -789,6 +1151,14 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       setIsPaused(false);
       setPipelineStatus('listening');
 
+      // Resume PCM stream recorders
+      if (micPcmRecorderRef.current) {
+        try { micPcmRecorderRef.current.resume(); } catch {}
+      }
+      if (tabPcmRecorderRef.current) {
+        try { tabPcmRecorderRef.current.resume(); } catch {}
+      }
+
       // Resume speech recognition
       if (recognitionRef.current) {
         try { recognitionRef.current.start(); } catch {}
@@ -801,6 +1171,14 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       // PAUSE
       setIsPaused(true);
       setPipelineStatus('paused');
+
+      // Pause PCM stream recorders
+      if (micPcmRecorderRef.current) {
+        try { micPcmRecorderRef.current.pause(); } catch {}
+      }
+      if (tabPcmRecorderRef.current) {
+        try { tabPcmRecorderRef.current.pause(); } catch {}
+      }
 
       // Pause speech recognition
       if (recognitionRef.current) {
@@ -819,13 +1197,16 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const handleAudioSourceModeChange = async (newMode: AudioSourceMode) => {
     setAudioSourceMode(newMode);
 
-    // Auto-answering is enabled across all modes:
-    // In MIC mode: Spoken questions from candidate mic trigger answers
-    // In DEVICE mode: Interviewer questions from device audio trigger answers
-    // In BOTH mode: Interviewer questions from device trigger answers; candidate mic speech does NOT trigger answers
+    // Auto-answering is enabled across all modes
     setAutoAnswer(true);
 
-    if (!isSessionActive) return;
+    if (!isSessionActiveRef.current) {
+      setIsSessionActive(true);
+      setIsPaused(false);
+      setSessionDuration(0);
+      setErrorMessage(null);
+      setPipelineStatus('listening');
+    }
 
     if (newMode === 'mic_only') {
       // Stop meeting tab audio
@@ -835,24 +1216,17 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         setIsTabAudioActive(false);
         setTabAudioLevel(0);
       }
+      if (tabPcmRecorderRef.current) {
+        try { tabPcmRecorderRef.current.stop(); } catch {}
+        tabPcmRecorderRef.current = null;
+      }
       if (tabMediaRecorderRef.current && tabMediaRecorderRef.current.state !== 'inactive') {
         try { tabMediaRecorderRef.current.stop(); } catch {}
         tabMediaRecorderRef.current = null;
       }
       // Ensure mic is active
-      if (!micMediaStreamRef.current) {
-        try {
-          const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          micMediaStreamRef.current = micStream;
-          startMicAudioMeter(micStream);
-        } catch {}
-      }
-      if (!recognitionRef.current) {
-        const rec = initSpeechRecognition();
-        if (rec) {
-          recognitionRef.current = rec;
-          try { rec.start(); } catch {}
-        }
+      if (!micMediaStreamRef.current || (!recognitionRef.current && !micPcmRecorderRef.current)) {
+        await startMicCapture();
       }
 
     } else if (newMode === 'device_only') {
@@ -861,6 +1235,10 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         micMediaStreamRef.current.getTracks().forEach(t => t.stop());
         micMediaStreamRef.current = null;
         setMicAudioLevel(0);
+      }
+      if (micPcmRecorderRef.current) {
+        try { micPcmRecorderRef.current.stop(); } catch {}
+        micPcmRecorderRef.current = null;
       }
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch {}
@@ -874,19 +1252,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
 
     } else if (newMode === 'both') {
       // Ensure both are active
-      if (!micMediaStreamRef.current) {
-        try {
-          const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          micMediaStreamRef.current = micStream;
-          startMicAudioMeter(micStream);
-        } catch {}
-      }
-      if (!recognitionRef.current) {
-        const rec = initSpeechRecognition();
-        if (rec) {
-          recognitionRef.current = rec;
-          try { rec.start(); } catch {}
-        }
+      if (!micMediaStreamRef.current || !micPcmRecorderRef.current) {
+        await startMicCapture();
       }
       if (!isTabAudioActive) {
         await handleCaptureTabAudio();
@@ -940,6 +1307,64 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     commitTurnAndAnswer(sampleText, 'manual', 'interviewer');
     setShowMeetGuide(false);
   };
+
+  if (floatingOnly) {
+    return (
+      <div 
+        id="floating-copilot-root"
+        className="w-full h-screen max-h-screen text-zinc-100 flex flex-col items-stretch justify-start font-sans relative bg-transparent p-0 overflow-hidden"
+      >
+        <FloatingCopilotOverlay
+          isOpen={true}
+          onClose={() => {
+            if (typeof window !== 'undefined') {
+              if ((window as any).electronAPI?.close) {
+                (window as any).electronAPI.close();
+              } else {
+                window.close();
+              }
+            }
+          }}
+          isStandalone={true}
+          isSessionActive={isSessionActive}
+          isPaused={isPaused}
+          onToggleSession={handleToggleSession}
+          onPauseResume={handlePauseResume}
+          sessionDuration={sessionDuration}
+          currentMode={currentMode}
+          onModeChange={setCurrentMode}
+          audioSourceMode={audioSourceMode}
+          onAudioSourceChange={handleAudioSourceModeChange}
+          answerTriggerPolicy={answerTriggerPolicy}
+          onAnswerTriggerPolicyChange={setAnswerTriggerPolicy}
+          pipelineStatus={pipelineStatus}
+          micAudioLevel={micAudioLevel}
+          tabAudioLevel={tabAudioLevel}
+          transcript={transcript}
+          interimTranscript={interimTranscript}
+          answers={answers}
+          activeSpeaker={activeSpeaker}
+          onToggleSpeaker={() => setActiveSpeaker(prev => prev === 'interviewer' ? 'candidate' : 'interviewer')}
+          onManualAnswer={handleGenerateAnswer}
+          onClearTranscript={() => setTranscript([])}
+          isLoadingAnswer={isLoadingAnswer}
+          isTabAudioActive={isTabAudioActive}
+          onCaptureTabAudio={handleCaptureTabAudio}
+          sttStatusNotice={sttStatusNotice}
+          onDismissNotice={() => setSttStatusNotice(null)}
+          audioInputDevices={audioInputDevices}
+          selectedMicDeviceId={selectedMicDeviceId}
+          onSelectMicDevice={handleSelectMicDevice}
+          speechLang={speechLang}
+          onSpeechLangChange={handleSpeechLangChange}
+          isMicReceivingAudio={isMicReceivingAudio}
+          isTabReceivingAudio={isTabReceivingAudio}
+          errorMessage={errorMessage}
+          onDismissError={() => setErrorMessage(null)}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -1402,10 +1827,39 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
               })
             )}
 
-            {/* Interim live speech preview */}
+            {/* Live Streaming Dialogue Turn (Smooth real-time word transition) */}
             {interimTranscript && (
-              <div className="p-2.5 rounded-xl border border-dashed border-zinc-700 bg-zinc-950/40 text-xs italic text-zinc-400 animate-pulse">
-                Listening... &ldquo;{interimTranscript}&rdquo;
+              <div
+                className={`p-3 rounded-xl border text-xs space-y-1.5 transition-all shadow-sm ${
+                  activeSpeaker === 'interviewer'
+                    ? 'bg-sky-950/40 border-sky-400/60 ring-1 ring-sky-500/30'
+                    : 'bg-emerald-950/40 border-emerald-400/60 ring-1 ring-emerald-500/30'
+                }`}
+              >
+                <div className="flex items-center justify-between text-[10px]">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`font-bold px-2 py-0.5 rounded-full ${
+                        activeSpeaker === 'interviewer'
+                          ? 'bg-sky-500/20 text-sky-300 border border-sky-400/30'
+                          : 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/30'
+                      }`}
+                    >
+                      {activeSpeaker === 'interviewer' ? '🎙️ Interviewer Speaking...' : '👤 You Speaking...'}
+                    </span>
+                    <span className="flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-400/40">
+                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+                      <span>LIVE</span>
+                    </span>
+                  </div>
+                  <span className="text-zinc-400 font-mono text-[9px]">Live Transition</span>
+                </div>
+                <p className={`leading-relaxed text-sm font-medium flex items-center flex-wrap gap-1 ${
+                  activeSpeaker === 'interviewer' ? 'text-sky-100' : 'text-emerald-100'
+                }`}>
+                  <span>{interimTranscript}</span>
+                  <span className="inline-block w-1.5 h-4 bg-cyan-400 animate-pulse ml-0.5 rounded-sm" />
+                </p>
               </div>
             )}
             <div ref={transcriptBottomRef} />
@@ -1636,6 +2090,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         audioInputDevices={audioInputDevices}
         selectedMicDeviceId={selectedMicDeviceId}
         onSelectMicDevice={handleSelectMicDevice}
+        speechLang={speechLang}
+        onSpeechLangChange={handleSpeechLangChange}
         isMicReceivingAudio={isMicReceivingAudio}
         isTabReceivingAudio={isTabReceivingAudio}
         errorMessage={errorMessage}

@@ -10,20 +10,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   restore: () => ipcRenderer.send('restore-window'),
   close: () => ipcRenderer.send('close-window'),
   setWindowSize: (width, height) => ipcRenderer.send('set-window-size', { width, height }),
-  moveWindow: (deltaX, deltaY) => ipcRenderer.send('move-window', { deltaX, deltaY })
+  moveWindow: (deltaX, deltaY) => ipcRenderer.send('move-window', { deltaX, deltaY }),
+  expandHUD: (width = 940, height = 460) => ipcRenderer.send('expand-hud', { width, height }),
+  collapseHUD: (width = 72, height = 72) => ipcRenderer.send('collapse-hud', { width, height })
 });
 
-// Immediately ensure DOM background is 100% transparent for real desktop glassmorphism
-window.addEventListener('DOMContentLoaded', () => {
-  if (document.documentElement) {
-    document.documentElement.classList.add('electron-window');
-    document.documentElement.style.background = 'transparent';
-    document.documentElement.style.backgroundColor = 'transparent';
-  }
-  if (document.body) {
-    document.body.classList.add('electron-window');
-    document.body.style.background = 'transparent';
-    document.body.style.backgroundColor = 'transparent';
-  }
-});
+// electronAPI exposed to main world cleanly without mutating DOM before React hydration
 

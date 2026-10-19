@@ -14,6 +14,7 @@ export type AudioPipelineStatus =
   | 'question_detected'
   | 'generating_answer' 
   | 'answer_ready' 
+  | 'no_speech'
   | 'error';
 
 export interface AudioInputDevice {

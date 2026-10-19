@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "eslint",
     "electron": "electron electron/main.js",
-    "desktop": "electron electron/main.js"
+    "desktop": "electron electron/main.js",
+    "localhost": "next dev"
   },
   "dependencies": {
     "lucide-react": "^1.59.0",

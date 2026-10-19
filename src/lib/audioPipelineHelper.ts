@@ -59,10 +59,10 @@ export function isMeaningfulQuestion(text: string): boolean {
 
   // Filler utterances to reject (prevents triggering on conversational noises)
   const fillers = [
-    'yes', 'yeah', 'yep', 'no', 'okay', 'ok', 'sure', 'right', 'mhm', 'uh', 'um',
-    'thanks', 'thank you', 'cool', 'sounds good', 'i see', 'got it', 'hello', 'hi',
+    'yes', 'yeah', 'yep', 'no', 'nope', 'okay', 'ok', 'sure', 'right', 'mhm', 'uh', 'um',
+    'thanks', 'thank you', 'cool', 'sounds good', 'i see', 'got it', 'hello', 'hi', 'hey',
     'can you hear me', 'am i audible', 'testing', 'audio check', 'good morning', 'good afternoon',
-    'good evening', 'how are you', 'great', 'awesome', 'fine'
+    'good evening', 'how are you', 'great', 'awesome', 'fine', 'bye', 'goodbye', 'see you'
   ];
   if (fillers.includes(lower)) return false;
 
@@ -75,7 +75,7 @@ export function isMeaningfulQuestion(text: string): boolean {
     'what are', 'how do', 'how does', 'how to', 'in your opinion', 'would you', 'give an example'
   ];
 
-  if (questionStarters.some(starter => lower.startsWith(starter) || lower.includes(` ${starter} `))) {
+  if (questionStarters.some(starter => lower.startsWith(starter) || lower.includes(` ${starter} `) || lower.includes(starter))) {
     return true;
   }
 
@@ -85,10 +85,19 @@ export function isMeaningfulQuestion(text: string): boolean {
     'b-tree', 'gin index', 'hash map', 'two sum', 'binary search', 'system design',
     'rate limiter', 'microservices', 'cap theorem', 'acid', 'garbage collection',
     'react hooks', 'useeffect', 'dependency injection', 'solid principles', 'rest api',
-    'graphql', 'kafka', 'redis', 'lru cache', 'tcp vs udp', 'localhost'
+    'graphql', 'kafka', 'redis', 'lru cache', 'tcp vs udp', 'localhost',
+    'polymorphism', 'inheritance', 'encapsulation', 'abstraction', 'array', 'arraylist',
+    'linkedlist', 'queue', 'stack', 'tree', 'graph', 'dynamic programming',
+    'java', 'python', 'javascript', 'typescript', 'sql', 'nosql', 'docker', 'kubernetes'
   ];
 
-  return technicalKeywords.some(keyword => lower.includes(keyword));
+  if (technicalKeywords.some(keyword => lower.includes(keyword))) {
+    return true;
+  }
+
+  // Any non-filler phrase with 3 or more words is accepted as an interview prompt
+  const wordCount = lower.split(/\s+/).filter(Boolean).length;
+  return wordCount >= 3;
 }
 
 /**
@@ -163,7 +172,7 @@ export function shouldTriggerAnswer(
   if (turn.source === 'manual') return true;
 
   // 1. MIC Mode:
-  // Spoken questions from candidate microphone trigger answers automatically
+  // Spoken questions from microphone trigger answers automatically
   if (audioSourceMode === 'mic_only') {
     if (turn.source !== 'mic') return false;
   }
@@ -175,12 +184,12 @@ export function shouldTriggerAnswer(
   }
 
   // 3. BOTH Mode:
-  // ONLY interviewer questions from device audio trigger answers automatically!
-  // Microphone audio (candidate voice answering aloud) MUST NEVER trigger answers (strictly prevents feedback loops)
+  // Interviewer questions from meeting audio trigger answers automatically.
+  // Questions spoken into the microphone also trigger answers if they are legitimate questions or prompts!
+  // Conversational fillers, short responses, and statements are filtered out by isMeaningfulQuestion.
   else if (audioSourceMode === 'both') {
-    if (turn.source !== 'meeting' && turn.speaker !== 'interviewer') {
-      return false;
-    }
+    // Both meeting audio and candidate mic questions are allowed if they are meaningful questions
+    // Conversational chatter/non-questions will be rejected below
   }
 
   // Must be a meaningful question or technical prompt
