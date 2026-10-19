@@ -69,15 +69,15 @@ export async function POST(req: NextRequest) {
     console.log(`[Transcribe API] Incoming audio: source=${source}, size=${audioBuffer.length} bytes, isWav=${isWav}` +
       (metrics ? `, duration=${metrics.durationSec}s, peak=${metrics.maxPeak}, rms=${metrics.rms}, isAudible=${metrics.isAudible}` : ''));
 
-    // Save latest chunk to project debug file for inspection
+    // Save latest chunk to temporary debug file for inspection
     try {
       if (isWav) {
-        const debugWavPath = path.join(process.cwd(), 'debug_last_chunk.wav');
+        const debugWavPath = path.join(os.tmpdir(), 'debug_last_chunk.wav');
         await fs.promises.writeFile(debugWavPath, audioBuffer);
       }
       const logLine = `[${new Date().toISOString()}] source=${source} size=${audioBuffer.length} ` +
         (metrics ? `dur=${metrics.durationSec}s peak=${metrics.maxPeak} rms=${metrics.rms} audible=${metrics.isAudible}` : 'non-wav') + '\n';
-      await fs.promises.appendFile(path.join(process.cwd(), 'transcribe_debug.log'), logLine);
+      await fs.promises.appendFile(path.join(os.tmpdir(), 'transcribe_debug.log'), logLine);
     } catch {}
 
     const groqKey = (clientKey && clientKey.startsWith('gsk_')) ? clientKey : process.env.GROQ_API_KEY;
@@ -244,52 +244,54 @@ export async function POST(req: NextRequest) {
           } catch {}
         }
 
-        // 4C. Windows Native SAPI fallback
-        const scriptPath = path.join(process.cwd(), 'scripts', 'transcribe-wav.ps1');
+        // 4C. Windows Native SAPI fallback (Windows only)
+        if (process.platform === 'win32') {
+          const scriptPath = path.join(process.cwd(), 'scripts', 'transcribe-wav.ps1');
 
-        console.log(`[Transcribe API] Spawning SAPI transcription: script=${scriptPath}, tempWav=${tempPath} (${audioBuffer.length} bytes)`);
+          console.log(`[Transcribe API] Spawning SAPI transcription: script=${scriptPath}, tempWav=${tempPath} (${audioBuffer.length} bytes)`);
 
-        const { stdout, stderr } = await execFileAsync('powershell.exe', [
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy', 'Bypass',
-          '-File', scriptPath,
-          '-WavPath', tempPath
-        ], { timeout: 8000 });
+          const { stdout, stderr } = await execFileAsync('powershell.exe', [
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', scriptPath,
+            '-WavPath', tempPath
+          ], { timeout: 8000 });
 
-        const elapsedMs = Date.now() - startTime;
-        const rawTranscript = (stdout || '').trim();
-        const errOutput = (stderr || '').trim();
-        console.log(`[Transcribe API] SAPI finished in ${elapsedMs}ms. Transcript: "${rawTranscript}"` + (errOutput ? `, Stderr: "${errOutput}"` : ''));
+          const elapsedMs = Date.now() - startTime;
+          const rawTranscript = (stdout || '').trim();
+          const errOutput = (stderr || '').trim();
+          console.log(`[Transcribe API] SAPI finished in ${elapsedMs}ms. Transcript: "${rawTranscript}"` + (errOutput ? `, Stderr: "${errOutput}"` : ''));
 
-        const transcript = rawTranscript.length >= 2 ? rawTranscript : '';
-        const reason = transcript 
-          ? 'SUCCESS' 
-          : (metrics && !metrics.isAudible ? 'AUDIO_SILENT' : 'NO_SPEECH_RECOGNIZED');
+          const transcript = rawTranscript.length >= 2 ? rawTranscript : '';
+          const reason = transcript 
+            ? 'SUCCESS' 
+            : (metrics && !metrics.isAudible ? 'AUDIO_SILENT' : 'NO_SPEECH_RECOGNIZED');
 
-        // Log completion to debug log
-        try {
-          const resultLog = `[${new Date().toISOString()}] SAPI result in ${elapsedMs}ms: "${transcript}" reason=${reason}\n`;
-          await fs.promises.appendFile(path.join(process.cwd(), 'transcribe_debug.log'), resultLog);
-        } catch {}
+          // Log completion to debug log
+          try {
+            const resultLog = `[${new Date().toISOString()}] SAPI result in ${elapsedMs}ms: "${transcript}" reason=${reason}\n`;
+            await fs.promises.appendFile(path.join(os.tmpdir(), 'transcribe_debug.log'), resultLog);
+          } catch {}
 
-        return NextResponse.json({
-          transcript,
-          provider: 'windows-sapi',
-          source,
-          metrics,
-          reason,
-          debug: {
-            sapiElapsedMs: elapsedMs,
-            stderr: errOutput || undefined
-          }
-        });
+          return NextResponse.json({
+            transcript,
+            provider: 'windows-sapi',
+            source,
+            metrics,
+            reason,
+            debug: {
+              sapiElapsedMs: elapsedMs,
+              stderr: errOutput || undefined
+            }
+          });
+        }
       } catch (sapiErr: unknown) {
         const elapsedMs = Date.now() - startTime;
         console.warn(`[Transcribe API] Local SAPI recognition error after ${elapsedMs}ms:`, sapiErr);
         try {
           const errLog = `[${new Date().toISOString()}] SAPI ERROR after ${elapsedMs}ms: ${String(sapiErr)}\n`;
-          await fs.promises.appendFile(path.join(process.cwd(), 'transcribe_debug.log'), errLog);
+          await fs.promises.appendFile(path.join(os.tmpdir(), 'transcribe_debug.log'), errLog);
         } catch {}
         return NextResponse.json({
           transcript: '',
