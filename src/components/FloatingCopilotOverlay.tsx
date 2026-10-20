@@ -11,7 +11,8 @@ import {
   Mic, Headphones, Settings, Minus, X, 
   Play, Pause, Copy, Check, RotateCcw, Send, 
   Key, Cpu, Eye, EyeOff, Sliders, Globe, Code, 
-  AlertCircle, CheckCircle2, MessageSquare
+  AlertCircle, CheckCircle2, MessageSquare,
+  Shield, ShieldCheck, ShieldAlert, ShieldOff
 } from 'lucide-react';
 import { normalizeTechnicalSpeech } from '@/lib/speechNormalizer';
 
@@ -114,6 +115,11 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
   const [transparency, setTransparency] = useState<number>(75);
   const [fontSize, setFontSize] = useState<'normal' | 'large'>('normal');
 
+  // Screen-capture privacy state (Electron BrowserWindow.setContentProtection)
+  const [screenProtection, setScreenProtection] = useState<boolean>(false);
+  const [isProtectionSupported, setIsProtectionSupported] = useState<boolean>(true);
+  const [protectionStatusText, setProtectionStatusText] = useState<string | null>(null);
+
   useEffect(() => {
     if (propSpeechLang) setSpeechLang(propSpeechLang);
   }, [propSpeechLang]);
@@ -157,8 +163,57 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
 
       const savedFont = localStorage.getItem('echocopilot_font_size') as any;
       if (savedFont) setFontSize(savedFont);
+
+      // Load screen-capture privacy setting
+      const savedProtection = localStorage.getItem('echocopilot_screen_protection');
+      const initialProtection = savedProtection === 'true';
+      setScreenProtection(initialProtection);
+
+      // Synchronize with Electron main process
+      if ((window as any).electronAPI?.getContentProtection) {
+        (window as any).electronAPI.getContentProtection()
+          .then((res: any) => {
+            if (res) {
+              setIsProtectionSupported(res.supported ?? true);
+              if (savedProtection !== null && (window as any).electronAPI?.setContentProtection) {
+                (window as any).electronAPI.setContentProtection(initialProtection);
+              } else if (res.enabled !== undefined) {
+                setScreenProtection(res.enabled);
+              }
+            }
+          })
+          .catch((err: any) => {
+            console.warn('[Overlay] getContentProtection check failed:', err);
+            setIsProtectionSupported(false);
+          });
+      }
     }
   }, []);
+
+  const handleToggleScreenProtection = async (enable: boolean) => {
+    setScreenProtection(enable);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('echocopilot_screen_protection', String(enable));
+      if ((window as any).electronAPI?.setContentProtection) {
+        try {
+          const res = await (window as any).electronAPI.setContentProtection(enable);
+          if (res && res.success) {
+            setProtectionStatusText(enable ? 'Screen privacy ON: Overlay hidden from meeting shares' : 'Screen privacy OFF: Window visible in screen shares');
+            setTimeout(() => setProtectionStatusText(null), 3500);
+          } else if (res && !res.success) {
+            setProtectionStatusText(res.error || 'Failed to update screen capture protection.');
+            setTimeout(() => setProtectionStatusText(null), 5000);
+          }
+        } catch (err: any) {
+          setProtectionStatusText('Error: ' + (err?.message || 'Failed to update protection'));
+          setTimeout(() => setProtectionStatusText(null), 5000);
+        }
+      } else {
+        setProtectionStatusText(enable ? 'Screen privacy enabled (web preview mode)' : 'Screen privacy disabled');
+        setTimeout(() => setProtectionStatusText(null), 3000);
+      }
+    }
+  };
 
   const saveSettings = () => {
     if (typeof window !== 'undefined') {
@@ -170,6 +225,7 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
       localStorage.setItem('echocopilot_speech_lang', speechLang);
       localStorage.setItem('echocopilot_transparency', String(transparency));
       localStorage.setItem('echocopilot_font_size', fontSize);
+      localStorage.setItem('echocopilot_screen_protection', String(screenProtection));
     }
     setShowSettings(false);
   };
@@ -671,6 +727,29 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
             style={{ WebkitAppRegion: 'no-drag', pointerEvents: 'auto' } as any}
             className="flex items-center gap-1 z-10"
           >
+            {/* 🛡️ SCREEN-CAPTURE PRIVACY QUICK TOGGLE */}
+            <button
+              type="button"
+              onClick={() => handleToggleScreenProtection(!screenProtection)}
+              style={{ WebkitAppRegion: 'no-drag', pointerEvents: 'auto' } as any}
+              className={`p-1 rounded border transition-colors cursor-pointer ${
+                screenProtection
+                  ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30'
+                  : 'bg-zinc-900/40 border-white/10 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60'
+              }`}
+              title={
+                screenProtection
+                  ? 'Screen Privacy: ACTIVE (Overlay is hidden from Zoom, Teams, Meet shares). Click to turn off.'
+                  : 'Screen Privacy: OFF (Window is visible in screen shares). Click to turn on.'
+              }
+            >
+              {screenProtection ? (
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              ) : (
+                <ShieldOff className="w-3.5 h-3.5 text-zinc-400" />
+              )}
+            </button>
+
             {/* ⚙️ GEAR ICON FOR SETTINGS */}
             <button
               type="button"
@@ -747,6 +826,31 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                 <X className="w-3 h-3" />
               </button>
             )}
+          </div>
+        )}
+
+        {/* Screen Protection Status Toast */}
+        {protectionStatusText && (
+          <div className={`px-3 py-1.5 border-b flex items-center justify-between text-xs shrink-0 animate-in fade-in ${
+            screenProtection 
+              ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-200' 
+              : 'bg-zinc-800/80 border-white/10 text-zinc-300'
+          }`}>
+            <div className="flex items-center gap-1.5">
+              {screenProtection ? (
+                <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+              ) : (
+                <ShieldOff className="w-3.5 h-3.5 shrink-0 text-zinc-400" />
+              )}
+              <span className="font-medium">{protectionStatusText}</span>
+            </div>
+            <button 
+              type="button" 
+              onClick={() => setProtectionStatusText(null)} 
+              className="text-zinc-400 hover:text-white p-0.5"
+            >
+              <X className="w-3 h-3" />
+            </button>
           </div>
         )}
 
@@ -1157,6 +1261,50 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                       >
                         Large
                       </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Screen-Capture Privacy Setting */}
+                <div className="p-2.5 rounded bg-zinc-900/80 border border-white/10 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5">
+                      <Shield className={`w-3.5 h-3.5 ${screenProtection ? 'text-emerald-400' : 'text-zinc-400'}`} />
+                      <span className="font-semibold text-zinc-200">Screen-Capture Privacy</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleScreenProtection(!screenProtection)}
+                      className={`px-2.5 py-1 rounded text-xs font-semibold border transition-all cursor-pointer ${
+                        screenProtection
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50 hover:bg-emerald-500/30'
+                          : 'bg-zinc-800 text-zinc-400 border-white/10 hover:text-zinc-200 hover:bg-zinc-700/60'
+                      }`}
+                    >
+                      {screenProtection ? '🛡️ Protection ACTIVE' : 'Inactive (Visible)'}
+                    </button>
+                  </div>
+
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Uses OS-level display affinity (<code className="text-zinc-300 bg-black/40 px-1 py-0.5 rounded font-mono text-[10px]">WDA_EXCLUDEFROMCAPTURE</code> on Windows / <code className="text-zinc-300 bg-black/40 px-1 py-0.5 rounded font-mono text-[10px]">NSWindowSharingNone</code> on macOS) to hide the EchoCopilot overlay from Zoom, Google Meet, Microsoft Teams, and screen recorders. The overlay remains 100% visible and interactive to you on your local display.
+                  </p>
+
+                  <div className="flex items-center gap-2 text-[10px]">
+                    <span className="text-zinc-400">Scope:</span>
+                    <span className="text-cyan-300 font-medium">EchoCopilot overlay only</span>
+                    <span className="text-zinc-600">|</span>
+                    <span className="text-zinc-400">OS Affinity:</span>
+                    <span className={isProtectionSupported ? 'text-emerald-400 font-medium' : 'text-amber-400 font-medium'}>
+                      {isProtectionSupported ? 'Supported' : 'Limited / Fallback'}
+                    </span>
+                  </div>
+
+                  {/* Honest Privacy Disclaimer */}
+                  <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-[10px] text-amber-300/90 leading-normal flex items-start gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 shrink-0 text-amber-400 mt-0.5" />
+                    <div>
+                      <strong className="text-amber-300">Privacy Notice: </strong>
+                      Protection works with standard screen-sharing tools and desktop capture APIs. However, hardware capture cards (HDMI capture), custom kernel/mirror display drivers, or specialized window hooks may bypass OS display affinity. Always perform a test screen share before relying on it in live interviews.
                     </div>
                   </div>
                 </div>

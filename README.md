@@ -56,6 +56,12 @@ An enterprise-grade, real-time AI interview copilot and preparation studio inspi
 - **Inline Renaming & Deletion:** Manage past records cleanly.
 - **Multi-Format Export:** Export full session transcripts and AI answers as Markdown (`.md`) or Plain Text (`.txt`).
 
+### 6. Floating Electron Desktop HUD & Screen-Capture Privacy
+- **Frameless Transparent Overlay:** Floats above Google Meet, Zoom, Microsoft Teams, and coding IDEs with native `alwaysOnTop: 'screen-saver'` behavior.
+- **Collapsible Mini State:** Minimize to a subtle 72x72 circular indicator or expand into the full dual-panel HUD (Live Transcript + Structured AI Answers).
+- **🛡️ Screen-Capture Privacy (Anti-Screen Recording):** Configurable native protection using Electron's `BrowserWindow.setContentProtection(true)` (Windows `WDA_EXCLUDEFROMCAPTURE` / macOS `NSWindowSharingNone`). The overlay remains 100% visible and interactive on your monitor, while being hidden/excluded from screen-sharing meeting software and desktop recorders.
+- **100% Offline AI & STT:** Operates locally using Faster-Whisper offline transcription and local Ollama (`qwen2.5:3b` / `llama3.2:1b`) with zero mandatory cloud dependence.
+
 ---
 
 ## 🛠️ Technology Stack
@@ -100,13 +106,22 @@ ANTHROPIC_API_KEY=sk-ant-...
 DEEPGRAM_API_KEY=...
 ```
 
-### 3. Run Development Server
+### 3. Run Development Server (Web Mode)
 ```bash
 npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) in Google Chrome or Microsoft Edge.
 
-### 4. Build for Production
+### 4. 1-Click Launching Desktop Floating HUD (Windows Offline Mode)
+Whenever you want to use the offline desktop floating HUD:
+- Simply double-click **`start-desktop.bat`** in the project directory.
+- It will automatically:
+  1. Detect and start Ollama local AI (`http://127.0.0.1:11434`)
+  2. Start Faster-Whisper local offline STT (`http://127.0.0.1:5001`)
+  3. Start the local server
+  4. Launch the transparent floating Electron HUD with Screen-Capture Privacy active!
+
+### 5. Build for Production
 ```bash
 npm run build
 npm run start

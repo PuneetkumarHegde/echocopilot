@@ -12,7 +12,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setWindowSize: (width, height) => ipcRenderer.send('set-window-size', { width, height }),
   moveWindow: (deltaX, deltaY) => ipcRenderer.send('move-window', { deltaX, deltaY }),
   expandHUD: (width = 940, height = 460) => ipcRenderer.send('expand-hud', { width, height }),
-  collapseHUD: (width = 72, height = 72) => ipcRenderer.send('collapse-hud', { width, height })
+  collapseHUD: (width = 72, height = 72) => ipcRenderer.send('collapse-hud', { width, height }),
+  setContentProtection: (enable) => ipcRenderer.invoke('set-content-protection', enable),
+  getContentProtection: () => ipcRenderer.invoke('get-content-protection')
 });
 
 // electronAPI exposed to main world cleanly without mutating DOM before React hydration

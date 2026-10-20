@@ -4,6 +4,9 @@ const http = require('http');
 
 let mainWindow = null;
 
+// Screen-capture protection state (defaults to false or configured via env/CLI)
+let isContentProtectionEnabled = process.env.PROTECT_SCREEN === 'true' || process.argv.includes('--protect-screen');
+
 // Set dedicated user data directory to avoid cache lock issues
 try {
   const tempUserData = path.join(app.getPath('temp'), 'echocopilot-electron-data');
@@ -91,6 +94,16 @@ function createWindow() {
   // Keep native window surface alpha at 1.0 so text and controls remain crisp,
   // while CSS dark glass rgba(10, 14, 23, alpha) provides true desktop see-through transparency
   mainWindow.setOpacity(1.0);
+
+  // Screen-capture protection: applied specifically to the EchoCopilot window
+  if (typeof mainWindow.setContentProtection === 'function') {
+    try {
+      mainWindow.setContentProtection(isContentProtectionEnabled);
+      console.log(`[Electron] mainWindow initial setContentProtection(${isContentProtectionEnabled}) applied`);
+    } catch (err) {
+      console.warn('[Electron] setContentProtection not supported or failed on initial window setup:', err.message);
+    }
+  }
 
   // Auto-grant permissions for microphone and display capture
   const ses = mainWindow.webContents.session;
@@ -190,6 +203,48 @@ ipcMain.on('set-always-on-top', (event, flag) => {
   if (win && !win.isDestroyed()) {
     win.setAlwaysOnTop(Boolean(flag), 'screen-saver');
   }
+});
+
+// Configurable screen-capture protection for the EchoCopilot window
+ipcMain.handle('set-content-protection', (event, enable) => {
+  const win = getTargetWin(event);
+  if (!win || win.isDestroyed()) {
+    return { success: false, error: 'Target window not available', enabled: false, supported: false };
+  }
+  if (typeof win.setContentProtection !== 'function') {
+    return {
+      success: false,
+      error: 'setContentProtection is not supported on this platform or Electron build',
+      enabled: false,
+      supported: false
+    };
+  }
+  try {
+    const boolVal = Boolean(enable);
+    win.setContentProtection(boolVal);
+    isContentProtectionEnabled = boolVal;
+    console.log(`[Electron] setContentProtection updated to: ${isContentProtectionEnabled}`);
+    return {
+      success: true,
+      enabled: isContentProtectionEnabled,
+      supported: true,
+      disclaimer: 'Protected via OS display affinity (Windows WDA_EXCLUDEFROMCAPTURE / macOS NSWindowSharingNone). Standard screen shares (Zoom, Meet, Teams) cannot capture this window, but hardware capture cards or specialized mirror drivers may bypass OS affinity.'
+    };
+  } catch (err) {
+    console.error('[Electron] Error executing setContentProtection:', err);
+    return { success: false, error: err.message, enabled: isContentProtectionEnabled, supported: false };
+  }
+});
+
+ipcMain.handle('get-content-protection', (event) => {
+  const win = getTargetWin(event);
+  const supported = Boolean(win && !win.isDestroyed() && typeof win.setContentProtection === 'function');
+  return {
+    supported,
+    enabled: isContentProtectionEnabled,
+    platform: process.platform,
+    disclaimer: 'Protected via OS display affinity. Note that specialized capture tools or hardware devices may bypass OS display affinity.'
+  };
 });
 
 ipcMain.on('minimize-window', (event) => {
