@@ -45,59 +45,84 @@ export function normalizeQuestionText(text: string): string {
     .trim();
 }
 
+import { 
+  classifyUtterance, 
+  isQuestionReadyForAnswer, 
+  mergeSpeechFragments, 
+  cleanPrematurePunctuation, 
+  formatCompleteQuestion 
+} from './questionClassifier';
+
 /**
- * Checks whether an utterance constitutes a legitimate technical question or prompt
+ * SpeechFragmentAccumulator manages successive speech recognition fragments for an interview question.
+ * - Accumulates successive speech fragments belonging to the same question across pauses.
+ * - Handles partial, overlapping, and cumulative speech-recognition updates without duplicating words.
+ * - Strips premature punctuation from incomplete fragments and restores terminal punctuation when complete.
+ * - Preserves the raw verbatim spoken transcript separately from the merged/normalized question.
+ * - Detects when incoming speech completes a pending comparison question.
  */
-export function isMeaningfulQuestion(text: string): boolean {
-  const trimmed = text.trim();
-  if (trimmed.length < 4) return false;
+export class SpeechFragmentAccumulator {
+  private rawFragments: string[] = [];
+  private currentMerged: string = '';
+  private lastUpdateTime: number = 0;
+  private readonly maxGapMs: number;
 
-  // Question mark
-  if (trimmed.endsWith('?')) return true;
-
-  const lower = trimmed.toLowerCase();
-
-  // Filler utterances to reject (prevents triggering on conversational noises)
-  const fillers = [
-    'yes', 'yeah', 'yep', 'no', 'nope', 'okay', 'ok', 'sure', 'right', 'mhm', 'uh', 'um',
-    'thanks', 'thank you', 'cool', 'sounds good', 'i see', 'got it', 'hello', 'hi', 'hey',
-    'can you hear me', 'am i audible', 'testing', 'audio check', 'good morning', 'good afternoon',
-    'good evening', 'how are you', 'great', 'awesome', 'fine', 'bye', 'goodbye', 'see you'
-  ];
-  if (fillers.includes(lower)) return false;
-
-  // Question or prompt keywords
-  const questionStarters = [
-    'what', 'why', 'how', 'when', 'where', 'explain', 'can you', 'could you', 'tell me',
-    'describe', 'define', 'is it', 'are there', 'does', 'do you', 'have you', 'which',
-    'difference between', 'difference', 'compare', 'implement', 'design', 'write a', 'write',
-    'walk me through', 'solve', 'discuss', 'suppose', 'assume', 'let\'s say', 'what is',
-    'what are', 'how do', 'how does', 'how to', 'in your opinion', 'would you', 'give an example'
-  ];
-
-  if (questionStarters.some(starter => lower.startsWith(starter) || lower.includes(` ${starter} `) || lower.includes(starter))) {
-    return true;
+  constructor(maxGapMs: number = 10000) {
+    this.maxGapMs = maxGapMs;
   }
 
-  // Technical interview topics that serve as direct problem statements
-  const technicalKeywords = [
-    'overloading', 'overriding', 'closure', 'event loop', 'deadlock', 'concurrency',
-    'b-tree', 'gin index', 'hash map', 'two sum', 'binary search', 'system design',
-    'rate limiter', 'microservices', 'cap theorem', 'acid', 'garbage collection',
-    'react hooks', 'useeffect', 'dependency injection', 'solid principles', 'rest api',
-    'graphql', 'kafka', 'redis', 'lru cache', 'tcp vs udp', 'localhost',
-    'polymorphism', 'inheritance', 'encapsulation', 'abstraction', 'array', 'arraylist',
-    'linkedlist', 'queue', 'stack', 'tree', 'graph', 'dynamic programming',
-    'java', 'python', 'javascript', 'typescript', 'sql', 'nosql', 'docker', 'kubernetes'
-  ];
+  public addFragment(incoming: string): { mergedText: string; rawText: string; isContinued: boolean } {
+    const trimmed = incoming.trim();
+    if (!trimmed) {
+      return { mergedText: this.currentMerged, rawText: this.getRawText(), isContinued: false };
+    }
 
-  if (technicalKeywords.some(keyword => lower.includes(keyword))) {
-    return true;
+    const now = Date.now();
+    const isContinued = this.rawFragments.length > 0 && (now - this.lastUpdateTime) <= this.maxGapMs;
+
+    if (!isContinued) {
+      this.rawFragments = [trimmed];
+      this.currentMerged = trimmed;
+    } else {
+      this.rawFragments.push(trimmed);
+      this.currentMerged = mergeSpeechFragments(this.currentMerged, trimmed);
+    }
+
+    this.lastUpdateTime = now;
+    return {
+      mergedText: this.currentMerged,
+      rawText: this.getRawText(),
+      isContinued
+    };
   }
 
-  // Any non-filler phrase with 3 or more words is accepted as an interview prompt
-  const wordCount = lower.split(/\s+/).filter(Boolean).length;
-  return wordCount >= 3;
+  public getRawText(): string {
+    return this.rawFragments.join(' ').trim();
+  }
+
+  public getMergedText(): string {
+    return this.currentMerged;
+  }
+
+  public hasPending(): boolean {
+    return this.rawFragments.length > 0 && (Date.now() - this.lastUpdateTime) <= this.maxGapMs;
+  }
+
+  public reset(): void {
+    this.rawFragments = [];
+    this.currentMerged = '';
+    this.lastUpdateTime = 0;
+  }
+}
+
+/**
+ * Checks whether an utterance constitutes a legitimate, complete technical question ready for answer generation,
+ * explicitly rejecting topic transitions, greetings, acknowledgements, and incomplete question fragments
+ * like "What is the difference?" or "What is the difference between".
+ */
+export function isMeaningfulQuestion(text: string, contextHistory: any[] = []): boolean {
+  const readiness = isQuestionReadyForAnswer(text, contextHistory);
+  return readiness.isReady;
 }
 
 /**
@@ -164,12 +189,15 @@ export function isAutoAnswerAllowedForMode(audioMode?: AudioSourceMode): boolean
 export function shouldTriggerAnswer(
   turn: TranscriptTurn,
   audioSourceMode: AudioSourceMode = 'both',
-  autoAnswerEnabled: boolean = true
+  autoAnswerEnabled: boolean = true,
+  contextHistory: any[] = []
 ): boolean {
   if (!autoAnswerEnabled) return false;
 
-  // Manual inputs always trigger answers immediately
-  if (turn.source === 'manual') return true;
+  // Manual inputs trigger answers if meaningful and complete
+  if (turn.source === 'manual') {
+    return isMeaningfulQuestion(turn.text, contextHistory);
+  }
 
   // 1. MIC Mode:
   // Spoken questions from microphone trigger answers automatically
@@ -186,14 +214,12 @@ export function shouldTriggerAnswer(
   // 3. BOTH Mode:
   // Interviewer questions from meeting audio trigger answers automatically.
   // Questions spoken into the microphone also trigger answers if they are legitimate questions or prompts!
-  // Conversational fillers, short responses, and statements are filtered out by isMeaningfulQuestion.
   else if (audioSourceMode === 'both') {
     // Both meeting audio and candidate mic questions are allowed if they are meaningful questions
-    // Conversational chatter/non-questions will be rejected below
   }
 
-  // Must be a meaningful question or technical prompt
-  return isMeaningfulQuestion(turn.text);
+  // Must be a complete, meaningful question ready for generation
+  return isMeaningfulQuestion(turn.text, contextHistory);
 }
 
 /**

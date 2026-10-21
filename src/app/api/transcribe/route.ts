@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { normalizeTechnicalTerms } from '@/lib/technicalTermNormalizer';
 
 const execFileAsync = promisify(execFile);
 
@@ -274,15 +275,20 @@ export async function POST(req: NextRequest) {
             await fs.promises.appendFile(path.join(os.tmpdir(), 'transcribe_debug.log'), resultLog);
           } catch {}
 
+          const normResult = normalizeTechnicalTerms(transcript);
+
           return NextResponse.json({
-            transcript,
+            transcript: normResult.normalizedText,
+            rawTranscript: transcript,
+            corrections: normResult.corrections,
             provider: 'windows-sapi',
             source,
             metrics,
             reason,
             debug: {
               sapiElapsedMs: elapsedMs,
-              stderr: errOutput || undefined
+              stderr: errOutput || undefined,
+              normalizationLatencyMs: normResult.latencyMs
             }
           });
         }

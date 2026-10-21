@@ -44,6 +44,8 @@ export interface FloatingCopilotOverlayProps {
   onManualAnswer: (prompt: string) => void;
   onClearTranscript?: () => void;
   isLoadingAnswer: boolean;
+  streamingText?: string | null;
+  firstTokenLatency?: number | null;
   isTabAudioActive: boolean;
   onCaptureTabAudio: () => void;
   sttStatusNotice?: string | null;
@@ -82,8 +84,12 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
   onManualAnswer,
   onClearTranscript,
   isLoadingAnswer,
+  streamingText,
+  firstTokenLatency,
   isTabAudioActive,
   onCaptureTabAudio,
+  sttStatusNotice,
+  onDismissNotice,
   audioInputDevices = [],
   selectedMicDeviceId,
   onSelectMicDevice,
@@ -119,6 +125,49 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
   const [screenProtection, setScreenProtection] = useState<boolean>(false);
   const [isProtectionSupported, setIsProtectionSupported] = useState<boolean>(true);
   const [protectionStatusText, setProtectionStatusText] = useState<string | null>(null);
+
+  // Standalone window broadcast state for streaming answers
+  const [localStreamingText, setLocalStreamingText] = useState<string>('');
+  const [localFirstTokenLatency, setLocalFirstTokenLatency] = useState<number | null>(null);
+  const [localStatusNotice, setLocalStatusNotice] = useState<string | null>(null);
+  const overlayRequestIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return;
+    const bc = new BroadcastChannel('echocopilot_channel');
+    bc.onmessage = (e) => {
+      const data = e.data;
+      if (!data) return;
+      if (data.type === 'STATUS_NOTICE') {
+        setLocalStatusNotice(data.message || null);
+      } else if (data.type === 'STREAM_START') {
+        setLocalStatusNotice(null);
+        if (data.requestId) overlayRequestIdRef.current = data.requestId;
+        setLocalStreamingText('');
+        setLocalFirstTokenLatency(null);
+      } else if (data.type === 'STREAM_FIRST_TOKEN') {
+        if (!data.requestId || data.requestId >= overlayRequestIdRef.current) {
+          setLocalFirstTokenLatency(data.timeToFirstTokenMs);
+        }
+      } else if (data.type === 'STREAM_CHUNK') {
+        if (!data.requestId || data.requestId >= overlayRequestIdRef.current) {
+          setLocalStreamingText(data.accumulated || '');
+        }
+      } else if (data.type === 'STREAM_DONE' || data.type === 'STREAM_ABORT') {
+        if (!data.requestId || data.requestId >= overlayRequestIdRef.current) {
+          setLocalStreamingText('');
+          setLocalFirstTokenLatency(null);
+        }
+      }
+    };
+    return () => {
+      bc.close();
+    };
+  }, []);
+
+  const activeStatusNotice = sttStatusNotice || localStatusNotice;
+  const displayedStreamingText = streamingText || localStreamingText;
+  const displayedFirstTokenLatency = firstTokenLatency ?? localFirstTokenLatency;
 
   useEffect(() => {
     if (propSpeechLang) setSpeechLang(propSpeechLang);
@@ -854,6 +903,21 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
           </div>
         )}
 
+        {/* Listening For Rest of Question / STT Status Notice */}
+        {activeStatusNotice && (
+          <div className="bg-cyan-950/60 border-b border-cyan-500/30 px-3 py-1.5 flex items-center justify-between text-xs text-cyan-300 shrink-0 animate-in fade-in duration-100">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping shrink-0" />
+              <span className="font-medium text-[11px] tracking-wide">{activeStatusNotice}</span>
+            </div>
+            {onDismissNotice && (
+              <button type="button" onClick={onDismissNotice} className="text-cyan-400 hover:text-white p-0.5">
+                <X className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+        )}
+
         {/* -------------------------------------------------------------
          * MAIN 2-COLUMN SURFACE: LIVE TRANSCRIPT & LIVE AI ANSWER
          * Directly on the transparent surface — No boxes or cards around content
@@ -942,6 +1006,11 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                     <p className={`text-zinc-100 leading-relaxed ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
                       {turn.text}
                     </p>
+                    {turn.corrections && turn.corrections.length > 0 && (
+                      <span className="text-[9px] text-amber-300/80 font-mono" style={textShadowStyle}>
+                        ✓ {turn.corrections.map(c => `${c.original} → ${c.corrected}`).join(', ')}
+                      </span>
+                    )}
                   </div>
                 );
               })}
@@ -1010,11 +1079,31 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
               ref={answerContainerRef}
               className="flex-1 min-h-0 overflow-y-auto space-y-2.5 pr-1 font-sans select-text"
             >
-              {/* Generating Shimmer */}
+              {/* Real-time Streaming Answer & TTFT Badge */}
               {isLoadingAnswer && (
-                <div className="py-4 text-cyan-300 text-xs flex items-center gap-2 animate-pulse" style={textShadowStyle}>
-                  <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
-                  <span>Synthesizing answer using {aiModel}...</span>
+                <div className="space-y-2 py-2 animate-in fade-in duration-100 border-b border-cyan-500/20 pb-3 mb-2">
+                  <div className="flex items-center justify-between text-[10px]">
+                    <span className="flex items-center gap-1.5 text-cyan-300 font-semibold" style={textShadowStyle}>
+                      <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                      <span>Streaming real-time answer ({aiModel})...</span>
+                    </span>
+                    {displayedFirstTokenLatency !== null && displayedFirstTokenLatency !== undefined && (
+                      <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono text-[9px] font-bold shadow-[0_0_8px_rgba(16,185,129,0.3)]">
+                        ⚡ {displayedFirstTokenLatency}ms to first token
+                      </span>
+                    )}
+                  </div>
+                  {displayedStreamingText ? (
+                    <div className={`text-zinc-100 leading-relaxed font-sans whitespace-pre-wrap ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
+                      {displayedStreamingText}
+                      <span className="inline-block w-1.5 h-3.5 bg-cyan-400 animate-pulse ml-0.5 rounded-sm align-middle shadow-[0_0_4px_#06b6d4]" />
+                    </div>
+                  ) : (
+                    <div className="py-2 text-cyan-300/80 text-xs flex items-center gap-2 animate-pulse" style={textShadowStyle}>
+                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                      <span>Synthesizing answer...</span>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1044,12 +1133,20 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                   </div>
 
                   {/* 1. Summary */}
-                  <div className={`text-zinc-100 font-medium leading-relaxed ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
+                  <div className={`text-zinc-100 font-medium leading-relaxed whitespace-pre-wrap ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
                     {answer.summary}
                   </div>
 
-                  {/* 2. Spoken Script ("What to say out loud") */}
-                  {answer.spokenScript && (
+                  {/* Incomplete indicator (if generation was cut off) */}
+                  {answer.isIncomplete && (
+                    <div className="flex items-center gap-1.5 text-amber-300 text-[10px] mt-1 bg-amber-500/10 border border-amber-500/25 px-2 py-1 rounded">
+                      <AlertCircle className="w-3 h-3 shrink-0 text-amber-400" />
+                      <span>Response incomplete (generation was interrupted by token limit or stream end)</span>
+                    </div>
+                  )}
+
+                  {/* 2. Spoken Script ("What to say out loud" - only when distinct from summary) */}
+                  {answer.spokenScript && answer.spokenScript.trim() !== answer.summary.trim() && (
                     <div className="pl-2 border-l-2 border-cyan-400/60 my-1">
                       <div className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider mb-0.5" style={textShadowStyle}>
                         What to say out loud

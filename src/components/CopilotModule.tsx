@@ -13,8 +13,22 @@ import {
   isAutoAnswerAllowedForMode, formatAudioErrorMessage,
   enumerateAudioInputDevices, calculateAudioLevel
 } from '@/lib/audioPipelineHelper';
+import { 
+  classifyUtterance, 
+  mergeSpeechFragments, 
+  ConversationContextTracker, 
+  isNewIndependentQuestion,
+  isQuestionReadyForAnswer,
+  hasValidComparisonSubjects,
+  cleanPrematurePunctuation,
+  formatCompleteQuestion,
+  QuestionCategory,
+  ClassificationResult
+} from '@/lib/questionClassifier';
 import { normalizeTechnicalSpeech } from '@/lib/speechNormalizer';
+import { normalizeTechnicalTerms, TermNormalizationResult } from '@/lib/technicalTermNormalizer';
 import { startPcmStreamRecorder, PcmStreamRecorder } from '@/lib/wavRecorder';
+import { parseStreamingAnswer } from '@/lib/aiFallback';
 import { FloatingCopilotOverlay } from './FloatingCopilotOverlay';
 import { 
   Mic, MicOff, Play, Square, Pause, Sparkles, Clock, 
@@ -94,6 +108,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const [activeSpeaker, setActiveSpeaker] = useState<'interviewer' | 'candidate'>('interviewer');
   const [answers, setAnswers] = useState<CopilotAnswer[]>([]);
   const [isLoadingAnswer, setIsLoadingAnswer] = useState(false);
+  const [streamingAnswerText, setStreamingAnswerText] = useState<string>('');
+  const [firstTokenLatency, setFirstTokenLatency] = useState<number | null>(null);
   const [manualInput, setManualInput] = useState(initialPrompt);
   const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
@@ -142,6 +158,14 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const accumulatedSpeechRef = useRef<string>('');
   const micPcmRecorderRef = useRef<PcmStreamRecorder | null>(null);
   const tabPcmRecorderRef = useRef<PcmStreamRecorder | null>(null);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
+  const inFlightQueryRef = useRef<string | null>(null);
+  const activeRequestIdRef = useRef<number>(0);
+  const pendingSpeechBufferRef = useRef<string>('');
+  const pendingRawBufferRef = useRef<string>('');
+  const transcriptRef = useRef<TranscriptTurn[]>([]);
+  const speechFragmentTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const contextTrackerRef = useRef<ConversationContextTracker>(new ConversationContextTracker(5));
 
   // Synchronize Refs
   const speechLangRef = useRef(speechLang);
@@ -152,6 +176,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   useEffect(() => { isSessionActiveRef.current = isSessionActive; }, [isSessionActive]);
   useEffect(() => { isPausedRef.current = isPaused; }, [isPaused]);
   useEffect(() => { activeSpeakerRef.current = activeSpeaker; }, [activeSpeaker]);
+  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
 
   // Handle external initial prompt from Question Bank
   useEffect(() => {
@@ -200,11 +225,17 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     bc.onmessage = (event) => {
       const data = event.data;
       if (!data) return;
-      if (data.type === 'NEW_ANSWER' && data.answer) {
+      if (data.type === 'STATUS_NOTICE') {
+        setSttStatusNotice(data.message || null);
+      } else if (data.type === 'NEW_ANSWER' && data.answer) {
+        if (data.requestId && data.requestId < activeRequestIdRef.current) return;
         setAnswers(prev => {
           if (prev.some(a => a.id === data.answer.id)) return prev;
           return [data.answer, ...prev];
         });
+        setStreamingAnswerText('');
+        setFirstTokenLatency(null);
+        setIsLoadingAnswer(false);
         setPipelineStatus('answer_ready');
       } else if (data.type === 'NEW_TURN' && data.turn) {
         setTranscript(prev => {
@@ -214,6 +245,32 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         setInterimTranscript('');
       } else if (data.type === 'INTERIM_SPEECH') {
         setInterimTranscript(data.text || '');
+      } else if (data.type === 'STREAM_START') {
+        if (data.requestId && data.requestId < activeRequestIdRef.current) return;
+        if (data.requestId) activeRequestIdRef.current = data.requestId;
+        setSttStatusNotice(null);
+        setIsLoadingAnswer(true);
+        setStreamingAnswerText('');
+        setFirstTokenLatency(null);
+        setPipelineStatus('generating_answer');
+      } else if (data.type === 'STREAM_FIRST_TOKEN') {
+        if (data.requestId && data.requestId < activeRequestIdRef.current) return;
+        setFirstTokenLatency(data.timeToFirstTokenMs);
+      } else if (data.type === 'STREAM_CHUNK') {
+        if (data.requestId && data.requestId < activeRequestIdRef.current) return;
+        setStreamingAnswerText(data.accumulated || '');
+      } else if (data.type === 'STREAM_DONE') {
+        if (data.requestId && data.requestId < activeRequestIdRef.current) return;
+        setIsLoadingAnswer(false);
+        setStreamingAnswerText('');
+        setFirstTokenLatency(null);
+        setPipelineStatus('answer_ready');
+      } else if (data.type === 'STREAM_ABORT') {
+        if (data.requestId && data.requestId < activeRequestIdRef.current) return;
+        setIsLoadingAnswer(false);
+        setStreamingAnswerText('');
+        setFirstTokenLatency(null);
+        setPipelineStatus('idle');
       }
     };
     return () => {
@@ -428,6 +485,20 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       try { recognitionRef.current.stop(); } catch {}
       recognitionRef.current = null;
     }
+
+    // 7. Clear pending fragment timers and cancel in-flight AI answers
+    if (speechFragmentTimerRef.current) {
+      clearTimeout(speechFragmentTimerRef.current);
+      speechFragmentTimerRef.current = null;
+    }
+    pendingSpeechBufferRef.current = '';
+    if (activeAbortControllerRef.current) {
+      try { activeAbortControllerRef.current.abort(); } catch {}
+      activeAbortControllerRef.current = null;
+    }
+    inFlightQueryRef.current = null;
+    setStreamingAnswerText('');
+    setFirstTokenLatency(null);
 
     setIsMicListening(false);
     setIsTabAudioActive(false);
@@ -907,7 +978,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   };
 
   // -------------------------------------------------------------
-  // 8. Unified Utterance Committer & Feedback-Loop-Free Answer Dispatch
+  // -------------------------------------------------------------
+  // 8. Unified Utterance Committer & Speech Fragment Merger
   // -------------------------------------------------------------
   const commitTurnAndAnswer = (
     speechText: string,
@@ -930,60 +1002,203 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       speaker = audioSourceModeRef.current === 'mic_only' ? 'interviewer' : (activeSpeakerRef.current || 'interviewer');
     }
 
-    // Create transcript turn
+    // Check if there is pending speech fragment buffered, or if incoming speech extends the previous incomplete turn
+    let baseSpeech = pendingSpeechBufferRef.current;
+    let baseRaw = pendingRawBufferRef.current || baseSpeech;
+    let extendingTurnId: string | null = null;
+
+    if (!baseSpeech && source !== 'manual' && transcriptRef.current.length > 0) {
+      const last = transcriptRef.current[transcriptRef.current.length - 1];
+      if (last && last.speaker === speaker && (Date.now() - last.timestamp) < 15000) {
+        // Can extend if last turn did not trigger an answer, or was not a complete ready question
+        const lastReadiness = isQuestionReadyForAnswer(last.text);
+        if (!last.triggeredAnswer || !lastReadiness.isReady) {
+          const lowerTrimmed = trimmed.toLowerCase();
+          const candidateMerge = mergeSpeechFragments(last.text, trimmed);
+          const candidateReady = isQuestionReadyForAnswer(candidateMerge).isReady;
+
+          const isContinuation = (
+            lowerTrimmed.startsWith('between') ||
+            lowerTrimmed.startsWith('and') ||
+            lowerTrimmed.startsWith('or') ||
+            lowerTrimmed.startsWith('to') ||
+            lowerTrimmed.startsWith('with') ||
+            lowerTrimmed.startsWith('vs') ||
+            lowerTrimmed.startsWith('versus') ||
+            lowerTrimmed.startsWith('for') ||
+            (/\b(difference|differences|differ|distinguish)\b/i.test(last.text) && hasValidComparisonSubjects(`between ${trimmed}`)) ||
+            candidateReady
+          );
+
+          if (isContinuation) {
+            baseSpeech = last.text;
+            baseRaw = last.rawText || last.text;
+            extendingTurnId = last.id;
+          }
+        }
+      }
+    }
+
+    const rawCandidate = baseSpeech
+      ? mergeSpeechFragments(baseSpeech, trimmed)
+      : trimmed;
+    const mergedRaw = baseRaw
+      ? `${cleanPrematurePunctuation(baseRaw)} ${trimmed}`.trim()
+      : trimmed;
+
+    // Run local technical-term guess engine first before classification and answer generation
+    const normResult = normalizeTechnicalTerms(
+      rawCandidate,
+      contextTrackerRef.current.getRecentHistory().map(h => h.question)
+    );
+    const candidateText = normResult.normalizedText;
+
+    // Lightweight NLP utterance classification using conversation context on normalized text
+    const history = contextTrackerRef.current.getRecentHistory();
+    const classification = classifyUtterance(candidateText, history);
+    const readiness = isQuestionReadyForAnswer(candidateText, history);
+
+    // Incomplete fragment or uncompleted question needing more speech (Requirement 1 & 2)
+    if (source !== 'manual' && (!readiness.isReady && readiness.needsMoreSpeech)) {
+      console.log(`[CopilotModule] Incomplete question/fragment detected: "${rawCandidate}" (${readiness.reason}) -> buffering for continuation`);
+      pendingSpeechBufferRef.current = candidateText;
+      pendingRawBufferRef.current = mergedRaw;
+      setInterimTranscript(candidateText);
+      setSttStatusNotice('Listening for the rest of the question…');
+      setPipelineStatus('listening');
+
+      // Broadcast interim to floating HUD
+      try {
+        if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+          const bc = new BroadcastChannel('echocopilot_channel');
+          bc.postMessage({ type: 'STATUS_NOTICE', message: 'Listening for the rest of the question…' });
+          bc.postMessage({ type: 'INTERIM_SPEECH', text: candidateText, speaker });
+          bc.close();
+        }
+      } catch {}
+
+      // Start buffer timeout: if user pauses for 2500ms, finalize turn without calling Ollama or guessing subjects
+      if (speechFragmentTimerRef.current) {
+        clearTimeout(speechFragmentTimerRef.current);
+      }
+      speechFragmentTimerRef.current = setTimeout(() => {
+        const buffered = pendingSpeechBufferRef.current;
+        const bufferedRaw = pendingRawBufferRef.current || buffered;
+        pendingSpeechBufferRef.current = '';
+        pendingRawBufferRef.current = '';
+        setSttStatusNotice(null);
+        try {
+          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+            const bc = new BroadcastChannel('echocopilot_channel');
+            bc.postMessage({ type: 'STATUS_NOTICE', message: null });
+            bc.close();
+          }
+        } catch {}
+
+        if (buffered && buffered.length >= 2) {
+          finalizeUtteranceAndAnswer(buffered, bufferedRaw, source, speaker, extendingTurnId, classification, normResult, false /* allowTrigger */);
+        }
+      }, 2500);
+
+      return;
+    }
+
+    // Utterance is complete or ready: clear buffer and finalize
+    if (speechFragmentTimerRef.current) {
+      clearTimeout(speechFragmentTimerRef.current);
+      speechFragmentTimerRef.current = null;
+    }
+    pendingSpeechBufferRef.current = '';
+    pendingRawBufferRef.current = '';
+    setSttStatusNotice(null);
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const bc = new BroadcastChannel('echocopilot_channel');
+        bc.postMessage({ type: 'STATUS_NOTICE', message: null });
+        bc.close();
+      }
+    } catch {}
+
+    finalizeUtteranceAndAnswer(candidateText, mergedRaw, source, speaker, extendingTurnId, classification, normResult, true /* allowTrigger */);
+  };
+
+  const finalizeUtteranceAndAnswer = (
+    finalSpeech: string,
+    rawSpeech: string,
+    source: 'mic' | 'meeting' | 'manual',
+    speaker: 'interviewer' | 'candidate',
+    extendingTurnId?: string | null,
+    preClassification?: ClassificationResult,
+    preNormResult?: TermNormalizationResult,
+    allowTrigger: boolean = true
+  ) => {
+    const rawCandidate = rawSpeech.trim();
+    if (!rawCandidate || rawCandidate.length < 2) return;
+
+    const normResult = preNormResult || normalizeTechnicalTerms(
+      finalSpeech,
+      contextTrackerRef.current.getRecentHistory().map(h => h.question)
+    );
+    const text = normResult.normalizedText;
+    const classification = preClassification || classifyUtterance(text, contextTrackerRef.current.getRecentHistory());
+
+    // Create transcript turn with preserved original transcript for diagnostics
     const turn: TranscriptTurn = {
-      id: 'turn_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      id: extendingTurnId || ('turn_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6)),
       speaker,
       source,
-      text: trimmed,
+      text,
+      rawText: rawCandidate,
+      corrections: normResult.corrections.length > 0 ? normResult.corrections : undefined,
       timestamp: Date.now(),
-      isFinal: true
+      isFinal: true,
+      triggeredAnswer: false
     };
-    console.log(`[CopilotModule] commitTurnAndAnswer: turn added to UI state: id=${turn.id}, speaker=${speaker}, source=${source}, text="${trimmed}"`);
+    console.log(`[CopilotModule] Turn processed: "${text}" (Raw: "${rawCandidate}", Extending: ${extendingTurnId || 'none'}, Intent: ${classification.intent}, Category: ${classification.category})`);
 
     setTranscript(prev => {
+      let updated: TranscriptTurn[];
+      if (extendingTurnId) {
+        const idx = prev.findIndex(t => t.id === extendingTurnId);
+        if (idx !== -1) {
+          updated = [...prev];
+          updated[idx] = {
+            ...updated[idx],
+            text,
+            rawText: rawCandidate,
+            corrections: normResult.corrections.length > 0 ? normResult.corrections : updated[idx].corrections,
+            timestamp: Date.now(),
+            triggeredAnswer: allowTrigger
+          };
+          transcriptRef.current = updated;
+          return updated;
+        }
+      }
+
       if (prev.length > 0) {
         const last = prev[prev.length - 1];
         if (last) {
           const lastLower = last.text.toLowerCase().trim();
-          const newLower = trimmed.toLowerCase();
+          const newLower = text.toLowerCase();
           if (lastLower === newLower) {
             return prev;
           }
-          if (Date.now() - last.timestamp < 4000 && newLower.startsWith(lastLower) && last.speaker === speaker) {
-            const updated = [...prev];
-            updated[updated.length - 1] = { ...last, text: trimmed, timestamp: Date.now() };
+          if (Date.now() - last.timestamp < 10000 && (newLower.startsWith(lastLower) || newLower.includes(lastLower)) && last.speaker === speaker) {
+            updated = [...prev];
+            updated[updated.length - 1] = { ...last, text, rawText: rawCandidate, timestamp: Date.now() };
+            transcriptRef.current = updated;
             return updated;
           }
         }
       }
-      return [...prev, turn];
+      updated = [...prev, turn];
+      transcriptRef.current = updated;
+      return updated;
     });
+
     setInterimTranscript('');
-    setManualInput(trimmed);
+    setManualInput(text);
     lastInterimRef.current = '';
-
-    // AUTOMATIC ANSWER EVALUATION ACROSS ALL MODES:
-    // - In MIC mode: Spoken questions from candidate microphone trigger answers.
-    // - In DEVICE mode: Interviewer questions from device trigger answers.
-    // - In BOTH mode: Interviewer questions from device trigger answers automatically.
-    //                 Candidate mic responses NEVER trigger answers (feedback-loop free).
-    // - Manual inputs always trigger answers immediately.
-    const triggerAllowed = autoAnswerRef.current && shouldTriggerAnswer(
-      turn,
-      audioSourceModeRef.current,
-      true
-    );
-    
-    // DEDUPLICATION GUARD:
-    // Prevent duplicate triggers from rapid repeated speech events
-    const isNew = deduplicatorRef.current.isNewQuestion(trimmed);
-
-    if (triggerAllowed && isNew) {
-      turn.triggeredAnswer = true;
-      setPipelineStatus('question_detected');
-      handleGenerateAnswer(trimmed);
-    }
 
     // Broadcast turn to any open floating window
     try {
@@ -993,27 +1208,100 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         bc.close();
       }
     } catch {}
+
+    // Check readiness gate before deciding to trigger answer (Requirement 2)
+    const history = contextTrackerRef.current.getRecentHistory();
+    const readiness = isQuestionReadyForAnswer(text, history);
+
+    if (!allowTrigger || !readiness.isReady) {
+      console.log(`[CopilotModule] Turn recorded without triggering answer: "${text}" (Ready: ${readiness.isReady}, Reason: ${readiness.reason})`);
+      return;
+    }
+
+    // Check if this is a non-question (TOPIC_TRANSITION, ACKNOWLEDGEMENT, GREETING, STATEMENT)
+    if (!classification.isQuestion && source !== 'manual') {
+      console.log(`[CopilotModule] Non-question bypassed: "${text}" (Intent: ${classification.intent}, Reason: ${classification.reason}) -> Ollama not called`);
+      return;
+    }
+
+    // AUTOMATIC ANSWER EVALUATION ACROSS ALL MODES:
+    const triggerAllowed = autoAnswerRef.current && shouldTriggerAnswer(
+      turn,
+      audioSourceModeRef.current,
+      true,
+      history
+    );
+
+    // DEDUPLICATION GUARD: Prevent duplicate triggers from rapid repeated speech events
+    const isNew = deduplicatorRef.current.isNewQuestion(text);
+
+    if (triggerAllowed && isNew) {
+      turn.triggeredAnswer = true;
+      setPipelineStatus('question_detected');
+      handleGenerateAnswer(text, classification.category);
+    }
   };
 
   // -------------------------------------------------------------
-  // 9. AI Copilot Answer Generator
+  // 9. AI Copilot Answer Generator with SSE Streaming & New Question Cancellation
   // -------------------------------------------------------------
-  const handleGenerateAnswer = async (promptText?: string) => {
-    const query = (promptText || manualInput).trim();
-    if (!query) return;
+  const handleGenerateAnswer = async (promptText?: string, explicitCategory?: QuestionCategory) => {
+    const rawQuery = (promptText || manualInput).trim();
+    if (!rawQuery) return;
+
+    // Gatekeeper: block incomplete questions from Ollama generation (Requirement 3)
+    const history = contextTrackerRef.current.getRecentHistory();
+    const readiness = isQuestionReadyForAnswer(rawQuery, history);
+    if (!readiness.isReady && readiness.needsMoreSpeech) {
+      console.log(`[CopilotModule] Blocked incomplete query from Ollama generation: "${rawQuery}" (${readiness.reason})`);
+      setSttStatusNotice('Listening for the rest of the question…');
+      return;
+    }
+
+    // Monotonically increasing request ID to track and reject stale responses (Requirement 5)
+    const currentRequestId = ++activeRequestIdRef.current;
+
+    // Requirement 5: Recognize when interviewer moves to a new independent question.
+    // Cancel in-flight generation, clear outdated active answer, and prioritize new question.
+    if (inFlightQueryRef.current && activeAbortControllerRef.current) {
+      if (inFlightQueryRef.current.toLowerCase() === rawQuery.toLowerCase()) {
+        console.log(`[CopilotModule] Query already actively generating for "${rawQuery}". Skipping duplicate fetch.`);
+        return;
+      }
+
+      const { shouldCancel, reason } = isNewIndependentQuestion(rawQuery, inFlightQueryRef.current);
+      if (shouldCancel) {
+        console.log(`[CopilotModule] Canceling in-flight answer for "${inFlightQueryRef.current}": ${reason}. Starting new question: "${rawQuery}"`);
+        try {
+          activeAbortControllerRef.current.abort();
+        } catch {}
+        activeAbortControllerRef.current = null;
+        setStreamingAnswerText('');
+        setFirstTokenLatency(null);
+
+        // Broadcast abort event so overlay clears immediately
+        try {
+          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+            const bc = new BroadcastChannel('echocopilot_channel');
+            bc.postMessage({ type: 'STREAM_ABORT', requestId: currentRequestId, supersededBy: rawQuery });
+            bc.close();
+          }
+        } catch {}
+      }
+    }
 
     // If manual query (not from speech committer), add turn to transcript feed
     if (promptText) {
       setTranscript(prev => {
         const last = prev[prev.length - 1];
-        if (last && last.text.toLowerCase().trim() === query.toLowerCase()) {
+        if (last && last.text.toLowerCase().trim() === rawQuery.toLowerCase()) {
           return prev;
         }
         const manualTurn: TranscriptTurn = {
           id: 'turn_manual_' + Date.now(),
           speaker: 'interviewer',
           source: 'manual',
-          text: query,
+          text: rawQuery,
           timestamp: Date.now(),
           isFinal: true,
           triggeredAnswer: true
@@ -1022,9 +1310,37 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       });
     }
 
+    // Requirement 4: Resolve context & follow-ups ("Why?", "What about the alternative?")
+    const { enrichedPrompt, isFollowUp, category } = 
+      contextTrackerRef.current.resolveContextualPrompt(rawQuery);
+
+    const finalCategory = explicitCategory || category;
+
+    // Setup AbortController for this question
+    const abortController = new AbortController();
+    activeAbortControllerRef.current = abortController;
+    inFlightQueryRef.current = rawQuery;
+
     setIsLoadingAnswer(true);
+    setStreamingAnswerText('');
+    setFirstTokenLatency(null);
     setErrorMessage(null);
     setPipelineStatus('generating_answer');
+
+    // Broadcast stream start event with request ID
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const bc = new BroadcastChannel('echocopilot_channel');
+        bc.postMessage({ 
+          type: 'STREAM_START', 
+          requestId: currentRequestId,
+          question: rawQuery, 
+          category: finalCategory, 
+          isFollowUp 
+        });
+        bc.close();
+      }
+    } catch {}
 
     try {
       let provider = 'ollama';
@@ -1038,49 +1354,205 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         ollamaUrl = localStorage.getItem('echocopilot_ollama_url') || 'http://localhost:11434';
       }
 
+      console.log(`[CopilotModule] Calling /api/copilot for: "${rawQuery}" (Req #${currentRequestId}, Category: ${finalCategory}, Follow-up: ${isFollowUp})`);
+
       const resp = await fetch('/api/copilot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: query,
+          prompt: enrichedPrompt,
           mode: currentMode,
           provider,
           apiKey,
           model,
-          ollamaUrl
-        })
+          ollamaUrl,
+          stream: true,
+          category: finalCategory,
+          contextHistory: history.map(h => ({ question: h.question, summary: h.summary }))
+        }),
+        signal: abortController.signal
       });
 
-      const data = await resp.json();
-
-      if (!resp.ok) {
-        throw new Error(data.error || 'Failed to fetch copilot answer');
+      if (!resp.ok && !resp.body) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${resp.status} from copilot API`);
       }
 
-      if (data.answer) {
-        setAnswers(prev => [data.answer, ...prev]);
-        setPipelineStatus('answer_ready');
-        if (data.setupNotice) {
-          setSetupNotice(data.setupNotice);
+      // Check if response is an SSE stream (Requirement 6: Fast streaming answers)
+      const contentType = resp.headers.get('content-type') || '';
+      if (contentType.includes('text/event-stream') && resp.body) {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let accumulatedText = '';
+        let finalAnswerReceived: CopilotAnswer | null = null;
+
+        while (true) {
+          if (activeRequestIdRef.current !== currentRequestId) {
+            console.log(`[CopilotModule] Canceling reader loop for superseded request #${currentRequestId} (active is #${activeRequestIdRef.current})`);
+            try { reader.cancel(); } catch {}
+            break;
+          }
+
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const messages = buffer.split('\n\n');
+          buffer = messages.pop() || '';
+
+          for (const message of messages) {
+            const lines = message.split('\n');
+            let eventType = '';
+            let dataStr = '';
+
+            for (const line of lines) {
+              if (line.startsWith('event:')) {
+                eventType = line.substring(6).trim();
+              } else if (line.startsWith('data:')) {
+                dataStr = line.substring(5).trim();
+              }
+            }
+
+            if (!dataStr) continue;
+
+            try {
+              const data = JSON.parse(dataStr);
+
+              if (eventType === 'first_token') {
+                const ttft = data.timeToFirstTokenMs || 0;
+                console.log(`[CopilotModule] First token latency (Req #${currentRequestId}): ${ttft}ms`);
+                if (activeRequestIdRef.current === currentRequestId) {
+                  setFirstTokenLatency(ttft);
+                  try {
+                    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+                      const bc = new BroadcastChannel('echocopilot_channel');
+                      bc.postMessage({ type: 'STREAM_FIRST_TOKEN', requestId: currentRequestId, timeToFirstTokenMs: ttft });
+                      bc.close();
+                    }
+                  } catch {}
+                }
+              } else if (eventType === 'chunk') {
+                accumulatedText += data.text || '';
+                if (activeRequestIdRef.current === currentRequestId) {
+                  setStreamingAnswerText(accumulatedText);
+                  try {
+                    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+                      const bc = new BroadcastChannel('echocopilot_channel');
+                      bc.postMessage({ type: 'STREAM_CHUNK', requestId: currentRequestId, text: data.text, accumulated: accumulatedText });
+                      bc.close();
+                    }
+                  } catch {}
+                }
+              } else if (eventType === 'done') {
+                if (data.answer) {
+                  finalAnswerReceived = data.answer;
+                }
+              }
+            } catch {}
+          }
         }
 
-        // Broadcast to floating HUD / popout windows
-        try {
-          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-            const bc = new BroadcastChannel('echocopilot_channel');
-            bc.postMessage({ type: 'NEW_ANSWER', answer: data.answer });
-            bc.close();
+        // Flush any trailing buffer data
+        buffer += decoder.decode();
+        if (buffer.trim() && activeRequestIdRef.current === currentRequestId) {
+          const messages = buffer.split('\n\n');
+          for (const message of messages) {
+            const lines = message.split('\n');
+            let eventType = '';
+            let dataStr = '';
+
+            for (const line of lines) {
+              if (line.startsWith('event:')) {
+                eventType = line.substring(6).trim();
+              } else if (line.startsWith('data:')) {
+                dataStr = line.substring(5).trim();
+              }
+            }
+
+            if (!dataStr) continue;
+
+            try {
+              const data = JSON.parse(dataStr);
+              if (eventType === 'chunk') {
+                accumulatedText += data.text || '';
+                setStreamingAnswerText(accumulatedText);
+              } else if (eventType === 'done' && data.answer) {
+                finalAnswerReceived = data.answer;
+              }
+            } catch {}
           }
-          if (typeof window !== 'undefined') {
-            localStorage.setItem('echocopilot_latest_answer', JSON.stringify(data.answer));
-          }
-        } catch {}
+        }
+
+        if (activeRequestIdRef.current !== currentRequestId) {
+          console.log(`[CopilotModule] Discarding completed stream for superseded request #${currentRequestId}`);
+          return;
+        }
+
+        // Stream completed: if done event was somehow missing, synthesize answer from accumulated text
+        if (!finalAnswerReceived && accumulatedText.trim()) {
+          console.log('[CopilotModule] Stream completed without explicit done event; synthesizing answer from accumulated text');
+          finalAnswerReceived = parseStreamingAnswer(accumulatedText, rawQuery, currentMode);
+        }
+
+        // If final answer is ready, verify request ID before saving and rendering (Requirement 5)
+        if (finalAnswerReceived && activeRequestIdRef.current === currentRequestId) {
+          const cleanAnswer = { ...finalAnswerReceived, question: rawQuery };
+          setAnswers(prev => [cleanAnswer, ...prev]);
+          contextTrackerRef.current.recordTurn(rawQuery, cleanAnswer.summary, finalCategory);
+          setPipelineStatus('answer_ready');
+
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('echocopilot_channel');
+              bc.postMessage({ type: 'STREAM_DONE', requestId: currentRequestId, answer: cleanAnswer });
+              bc.postMessage({ type: 'NEW_ANSWER', requestId: currentRequestId, answer: cleanAnswer });
+              bc.close();
+            }
+            if (typeof window !== 'undefined') {
+              localStorage.setItem('echocopilot_latest_answer', JSON.stringify(cleanAnswer));
+            }
+          } catch {}
+        }
+      } else {
+        // Fallback for non-streaming response
+        const data = await resp.json();
+        if (data.answer && activeRequestIdRef.current === currentRequestId) {
+          const cleanAnswer = { ...data.answer, question: rawQuery };
+          setAnswers(prev => [cleanAnswer, ...prev]);
+          contextTrackerRef.current.recordTurn(rawQuery, cleanAnswer.summary, finalCategory);
+          setPipelineStatus('answer_ready');
+          if (data.setupNotice) setSetupNotice(data.setupNotice);
+
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('echocopilot_channel');
+              bc.postMessage({ type: 'NEW_ANSWER', requestId: currentRequestId, answer: cleanAnswer });
+              bc.close();
+            }
+            if (typeof window !== 'undefined') {
+              localStorage.setItem('echocopilot_latest_answer', JSON.stringify(cleanAnswer));
+            }
+          } catch {}
+        }
       }
     } catch (err: unknown) {
+      if (activeRequestIdRef.current !== currentRequestId) return;
+      if ((err as Error).name === 'AbortError') {
+        console.log(`[CopilotModule] In-flight answer generation aborted for "${rawQuery}" (superseded by new question)`);
+        return;
+      }
       setErrorMessage((err as Error).message || 'Connection error while generating AI response.');
       setPipelineStatus('error');
     } finally {
-      setIsLoadingAnswer(false);
+      if (activeRequestIdRef.current === currentRequestId) {
+        if (inFlightQueryRef.current === rawQuery) {
+          inFlightQueryRef.current = null;
+        }
+        activeAbortControllerRef.current = null;
+        setIsLoadingAnswer(false);
+        setStreamingAnswerText('');
+      }
     }
   };
 
@@ -1348,6 +1820,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           onManualAnswer={handleGenerateAnswer}
           onClearTranscript={() => setTranscript([])}
           isLoadingAnswer={isLoadingAnswer}
+          streamingText={streamingAnswerText}
+          firstTokenLatency={firstTokenLatency}
           isTabAudioActive={isTabAudioActive}
           onCaptureTabAudio={handleCaptureTabAudio}
           sttStatusNotice={sttStatusNotice}
@@ -1822,6 +2296,18 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
                     <p className={`leading-relaxed ${isInterviewer ? 'text-sky-100 font-semibold' : 'text-emerald-100'}`}>
                       {turn.text}
                     </p>
+                    {turn.corrections && turn.corrections.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[10px] text-amber-300 font-mono">
+                        <span className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">
+                          🎯 Term normalized: {turn.corrections.map(c => `"${c.original}" → "${c.corrected}" (${Math.round(c.confidence * 100)}%)`).join(', ')}
+                        </span>
+                        {turn.rawText && turn.rawText !== turn.text && (
+                          <span className="text-zinc-500 text-[9px]" title={`Raw: ${turn.rawText}`}>
+                            (raw: "{turn.rawText}")
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })
@@ -1860,6 +2346,22 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
                   <span>{interimTranscript}</span>
                   <span className="inline-block w-1.5 h-4 bg-cyan-400 animate-pulse ml-0.5 rounded-sm" />
                 </p>
+              </div>
+            )}
+
+            {sttStatusNotice && (
+              <div className="p-2.5 rounded-xl border border-cyan-500/30 bg-cyan-950/40 text-xs flex items-center justify-between text-cyan-300 animate-in fade-in">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                  <span className="font-medium">{sttStatusNotice}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSttStatusNotice(null)}
+                  className="text-cyan-400 hover:text-white p-0.5 text-xs"
+                >
+                  ✕
+                </button>
               </div>
             )}
             <div ref={transcriptBottomRef} />
@@ -2083,6 +2585,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         onToggleSpeaker={() => setActiveSpeaker(prev => prev === 'interviewer' ? 'candidate' : 'interviewer')}
         onManualAnswer={handleGenerateAnswer}
         isLoadingAnswer={isLoadingAnswer}
+        streamingText={streamingAnswerText}
+        firstTokenLatency={firstTokenLatency}
         isTabAudioActive={isTabAudioActive}
         onCaptureTabAudio={handleCaptureTabAudio}
         sttStatusNotice={sttStatusNotice}

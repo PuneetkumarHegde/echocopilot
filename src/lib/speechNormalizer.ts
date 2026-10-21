@@ -23,14 +23,20 @@ const SAFE_TECH_REPLACEMENTS: [RegExp, string][] = [
   [/\boauth\s*2\b|\bo\s*auth\b/gi, 'OAuth 2.0']
 ];
 
-export function normalizeTechnicalSpeech(rawText: string): string {
+import { normalizeTechnicalTerms, TermNormalizationResult } from './technicalTermNormalizer';
+
+export function normalizeTechnicalSpeech(rawText: string, contextTopics?: string[]): string {
   if (!rawText || typeof rawText !== 'string') return '';
   let cleaned = rawText.trim();
 
-  // Apply only safe, unambiguous replacements
+  // 1. Apply unambiguous literal acronyms/syntax
   for (const [regex, replacement] of SAFE_TECH_REPLACEMENTS) {
     cleaned = cleaned.replace(regex, replacement);
   }
+
+  // 2. Apply local technical-term guess engine
+  const normResult = normalizeTechnicalTerms(cleaned, contextTopics);
+  cleaned = normResult.normalizedText;
 
   // Normalize extra whitespace
   cleaned = cleaned.replace(/\s{2,}/g, ' ');

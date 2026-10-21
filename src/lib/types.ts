@@ -23,11 +23,15 @@ export interface AudioInputDevice {
   groupId?: string;
 }
 
+import type { TermCorrection } from './technicalTermNormalizer';
+
 export interface TranscriptTurn {
   id: string;
   speaker: 'interviewer' | 'candidate';
   source?: 'mic' | 'meeting' | 'manual';
   text: string;
+  rawText?: string;
+  corrections?: TermCorrection[];
   timestamp: number;
   isFinal?: boolean;
   triggeredAnswer?: boolean;
@@ -59,6 +63,8 @@ export interface CopilotAnswer {
     result: string;
   };
   rawText?: string;
+  isIncomplete?: boolean;
+  doneReason?: string;
   timestamp: number;
 }
 
@@ -77,7 +83,7 @@ export interface SessionRecord {
 export interface QuestionItem {
   id: string;
   title: string;
-  category: 'Java' | 'SQL' | 'Data Structures & Algorithms' | 'Cybersecurity' | 'Behavioral' | 'System Design';
+  category: 'Java' | 'SQL' | 'Data Structures & Algorithms' | 'Cybersecurity' | 'Behavioral' | 'System Design' | string;
   difficulty: 'Easy' | 'Medium' | 'Hard';
   companies: string[];
   roles: string[];

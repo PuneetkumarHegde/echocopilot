@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { generateOllamaAnswer, generateSmartCopilotAnswer } from '@/lib/aiFallback';
+import { generateOllamaAnswer, generateSmartCopilotAnswer, buildQuestionSpecificPrompt, parseStreamingAnswer } from '@/lib/aiFallback';
 import { AnswerMode, CopilotAnswer } from '@/lib/types';
+import { QuestionCategory, classifyUtterance, isQuestionReadyForAnswer } from '@/lib/questionClassifier';
 
 interface CopilotRequestBody {
   prompt: string;
@@ -11,30 +12,63 @@ interface CopilotRequestBody {
   ollamaUrl?: string;
   resumeContext?: string;
   jobDescription?: string;
+  stream?: boolean;
+  category?: QuestionCategory;
+  contextHistory?: Array<{ question: string; summary: string }>;
 }
 
-const SYSTEM_INTERVIEW_PROMPT = `You are an elite, principal-level AI technical interview copilot providing live assistance during a software engineering interview.
-The candidate needs an authoritative, concise, and interview-ready answer.
+const SYSTEM_INTERVIEW_PROMPT = `You are EchoCopilot, an elite real-time interview assistant answering questions across all engineering disciplines (computer science, software, cybersecurity, electronics, electrical, mechanical, civil, chemical, and other engineering subjects), mathematics, science, communication, HR and behavioral interviews, project discussions, and general knowledge.
 
-Format your response strictly as a JSON object with this exact schema:
+MANDATORY RULES:
+1. Concise, layered, interview-ready answers: Every answer must be easy to speak naturally in an interview. Start with a short, accurate definition (1–2 sentences, speakable in 5–15 seconds). Provide optional supporting details in clearly separated sections. Never overwhelm the user with a long paragraph.
+2. No repetition and no filler: Do not repeat the same information in the definition, key points, and summary. Do not generate lengthy introductory explanations or conversational filler ("Sure", "Here is", "Let's understand this", "In an interview"). Start directly with the first definition or section.
+3. For definition questions: Use this exact structure in "summary":
+   **Definition**
+   [Short, accurate definition in 1–2 sentences, speakable in 5–15 seconds.]
+
+   **Key Points**
+   - [3 to 5 short bullets with essential principles, mechanisms, or rules]
+
+   **Example**
+   [Minimal, correct code snippet, formula, or practical example only when useful. Do not repeat definitions.]
+
+   **Important Note**
+   [Short, crucial caveat, rule, or edge case if needed.]
+4. For comparison questions ("What is the difference between X and Y?", "Explain X and Y.", "What are X and Y?", "X vs Y"): Use this exact structure in "summary":
+   **[Concept A] — Definition**
+   [Accurate definition of Concept A in 1–2 concise sentences.]
+
+   **[Concept B] — Definition**
+   [Accurate definition of Concept B in 1–2 concise sentences.]
+
+   **Key Differences**
+   - **Purpose:** [Distinction between Concept A and Concept B purpose]
+   - **Parameters / Signatures:** [Distinction in parameters, signatures, or core mechanism]
+   - **Polymorphism / Behavior:** [Distinction in runtime vs compile-time behavior, or practical trade-offs]
+
+   **Example**
+   [Short practical example or minimal compilable code only when useful. Do not repeat definitions in example explanation.]
+
+   **Interview Summary**
+   [1–2 sentence crisp closing contrast summary.]
+5. For how/why questions: Direct answer → essential steps or reasoning → example if useful.
+6. For coding questions: Brief approach → correct minimal compilable code → concise explanation and edge cases.
+7. For HR, behavioral, and communication questions: Provide a natural, speakable answer tailored to the question without unnecessary headings.
+8. For general knowledge: Direct answer with only the supporting detail needed. Omit irrelevant sections rather than generating filler.
+9. Accuracy before fluency: Never invent facts. Complete every sentence with proper terminal punctuation.
+
+Format your response strictly as a JSON object with this schema:
 {
-  "summary": "1 concise sentence delivering the direct, accurate technical answer or definition",
-  "spokenScript": "A natural, confident 2-3 sentence conversational script in first-person engineer voice ('In an interview, I would say: ...') explaining how to answer out loud smoothly without sounding robotic or textbook-like",
+  "summary": "Formatted layered markdown according to the question structure above.",
+  "spokenScript": "Short, natural script speaking the opening definition aloud in 5–15 seconds, without markdown headings or meta-phrases.",
   "bullets": [
-    "Core architecture, mechanism, or principle with exact technical terminology",
-    "Internal implementation details (e.g. data structure, algorithm, or concurrency model)",
-    "Edge case handling, scaling, or production optimization"
+    "Key Point / Difference 1",
+    "Key Point / Difference 2",
+    "Key Point / Difference 3"
   ],
-  "codeSnippet": {
-    "language": "typescript/python/java/sql",
-    "code": "// clean, production-ready, concise working code snippet\\n",
-    "explanation": "Brief breakdown of the approach",
-    "timeComplexity": "O(...)",
-    "spaceComplexity": "O(...)"
-  },
+  "codeSnippet": null, // Include ONLY when relevant/requested: { "language": "...", "code": "...", "explanation": "...", "timeComplexity": "...", "spaceComplexity": "..." }
   "tradeoffs": [
-    "Key engineering trade-off 1 (e.g., Memory vs CPU, CAP theorem)",
-    "Key engineering trade-off 2 (e.g., Consistency vs Read throughput)"
+    "Key trade-off or practical engineering consideration 1"
   ]
 }
 
@@ -188,11 +222,36 @@ export async function POST(req: NextRequest) {
       model, 
       ollamaUrl,
       resumeContext = '', 
-      jobDescription = '' 
+      jobDescription = '',
+      stream = false,
+      category
     } = body;
 
     if (!prompt || typeof prompt !== 'string') {
       return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
+    }
+
+    // Question completeness gate: reject incomplete questions (e.g. "What is the difference?")
+    const actualQuery = prompt.includes('Interviewer follow-up question:')
+      ? (prompt.split('Interviewer follow-up question:')[1]?.replace(/^[\s":]+|[\s":]+$/g, '') || prompt)
+      : prompt;
+
+    const contextTurns = (body.contextHistory || []).map((h: any) => ({
+      question: h.question,
+      summary: h.summary || '',
+      category: 'GENERAL' as QuestionCategory,
+      timestamp: Date.now()
+    }));
+
+    const readiness = isQuestionReadyForAnswer(actualQuery, contextTurns);
+    if (!readiness.isReady && readiness.needsMoreSpeech) {
+      console.warn(`[Copilot API] Incomplete question rejected before provider call: "${prompt}" (${readiness.reason})`);
+      return NextResponse.json({
+        error: `Incomplete question: ${readiness.reason}`,
+        isIncomplete: true,
+        reason: readiness.reason,
+        needsMoreSpeech: true
+      }, { status: 400 });
     }
 
     const groqKey = apiKey && provider === 'groq' ? apiKey : process.env.GROQ_API_KEY;
@@ -247,7 +306,175 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 4. Try Local Ollama Model (qwen2.5:3b / llama3.2)
+    // 4A. Real-time Streaming for Local Ollama Model (sub-300ms time to first token)
+    if (stream && (provider === 'ollama' || !provider || (!groqKey && !openAiKey && !anthropicKey))) {
+      const baseOllama = ollamaUrl || process.env.OLLAMA_API_URL || 'http://localhost:11434';
+      const genUrl = baseOllama.endsWith('/api/generate') ? baseOllama : `${baseOllama.replace(/\/$/, '')}/api/generate`;
+      const modelName = model || process.env.OLLAMA_MODEL || 'qwen2.5:3b';
+
+      const { systemPrompt, userPrompt } = buildQuestionSpecificPrompt(
+        prompt,
+        mode,
+        category,
+        resumeContext,
+        jobDescription
+      );
+
+      const startTime = Date.now();
+
+      try {
+        const ollamaStreamRes = await fetch(genUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: modelName,
+            prompt: `${systemPrompt}\n\nCandidate Question: ${userPrompt}`,
+            stream: true,
+            options: {
+              num_gpu: 99,
+              num_thread: 8,
+              num_ctx: 2048,
+              num_predict: 650,
+              temperature: 0.1
+            },
+            keep_alive: -1
+          }),
+          signal: req.signal
+        });
+
+        if (ollamaStreamRes.ok && ollamaStreamRes.body) {
+          const encoder = new TextEncoder();
+          let firstTokenTimeMs = 0;
+          let fullText = '';
+
+          const sseStream = new ReadableStream({
+            async start(controller) {
+              const reader = ollamaStreamRes.body!.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
+              let doneEmitted = false;
+              let doneReason = 'stop';
+
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop() || '';
+
+                  for (const line of lines) {
+                    const trimmedLine = line.trim();
+                    if (!trimmedLine) continue;
+
+                    try {
+                      const parsed = JSON.parse(trimmedLine);
+                      if (parsed.response) {
+                        if (!firstTokenTimeMs) {
+                          firstTokenTimeMs = Date.now() - startTime;
+                          controller.enqueue(
+                            encoder.encode(`event: first_token\ndata: ${JSON.stringify({ timeToFirstTokenMs: firstTokenTimeMs })}\n\n`)
+                          );
+                        }
+                        fullText += parsed.response;
+                        controller.enqueue(
+                          encoder.encode(`event: chunk\ndata: ${JSON.stringify({ text: parsed.response })}\n\n`)
+                        );
+                      }
+                      if (parsed.done && !doneEmitted) {
+                        doneEmitted = true;
+                        doneReason = parsed.done_reason || 'stop';
+                        const totalTimeMs = Date.now() - startTime;
+                        const finalAnswer = parseStreamingAnswer(fullText, prompt, mode, doneReason);
+                        controller.enqueue(
+                          encoder.encode(`event: done\ndata: ${JSON.stringify({
+                            answer: finalAnswer,
+                            source: 'ollama',
+                            model: modelName,
+                            timeToFirstTokenMs: firstTokenTimeMs || totalTimeMs,
+                            totalTimeMs,
+                            doneReason
+                          })}\n\n`)
+                        );
+                      }
+                    } catch {}
+                  }
+                }
+
+                // Flush any final buffered characters from the stream
+                buffer += decoder.decode();
+                if (buffer.trim()) {
+                  const remainingLines = buffer.split('\n');
+                  for (const rLine of remainingLines) {
+                    const trimmedR = rLine.trim();
+                    if (!trimmedR) continue;
+                    try {
+                      const parsed = JSON.parse(trimmedR);
+                      if (parsed.response) {
+                        fullText += parsed.response;
+                        controller.enqueue(
+                          encoder.encode(`event: chunk\ndata: ${JSON.stringify({ text: parsed.response })}\n\n`)
+                        );
+                      }
+                      if (parsed.done && !doneEmitted) {
+                        doneEmitted = true;
+                        doneReason = parsed.done_reason || 'stop';
+                        const totalTimeMs = Date.now() - startTime;
+                        const finalAnswer = parseStreamingAnswer(fullText, prompt, mode, doneReason);
+                        controller.enqueue(
+                          encoder.encode(`event: done\ndata: ${JSON.stringify({
+                            answer: finalAnswer,
+                            source: 'ollama',
+                            model: modelName,
+                            timeToFirstTokenMs: firstTokenTimeMs || totalTimeMs,
+                            totalTimeMs,
+                            doneReason
+                          })}\n\n`)
+                        );
+                      }
+                    } catch {}
+                  }
+                }
+
+                // If stream ended without explicit done event
+                if (!doneEmitted && fullText.trim()) {
+                  doneEmitted = true;
+                  const totalTimeMs = Date.now() - startTime;
+                  const finalAnswer = parseStreamingAnswer(fullText, prompt, mode, doneReason);
+                  controller.enqueue(
+                    encoder.encode(`event: done\ndata: ${JSON.stringify({
+                      answer: finalAnswer,
+                      source: 'ollama',
+                      model: modelName,
+                      timeToFirstTokenMs: firstTokenTimeMs || totalTimeMs,
+                      totalTimeMs,
+                      doneReason
+                    })}\n\n`)
+                  );
+                }
+              } catch (streamErr) {
+                controller.error(streamErr);
+              } finally {
+                controller.close();
+              }
+            }
+          });
+
+          return new Response(sseStream, {
+            headers: {
+              'Content-Type': 'text/event-stream; charset=utf-8',
+              'Cache-Control': 'no-cache, no-transform',
+              'Connection': 'keep-alive'
+            }
+          });
+        }
+      } catch (ollamaErr) {
+        console.warn('[Copilot API] Streaming Ollama error, falling back to synchronous:', ollamaErr);
+      }
+    }
+
+    // 4B. Try Local Ollama Model (Synchronous fallback)
     if (provider === 'ollama' || !provider || (!groqKey && !openAiKey && !anthropicKey)) {
       try {
         const ollamaAnswer = await generateOllamaAnswer(
@@ -256,7 +483,8 @@ export async function POST(req: NextRequest) {
           resumeContext, 
           jobDescription,
           model || 'qwen2.5:3b',
-          ollamaUrl || 'http://localhost:11434'
+          ollamaUrl || 'http://localhost:11434',
+          category
         );
 
         if (ollamaAnswer) {
