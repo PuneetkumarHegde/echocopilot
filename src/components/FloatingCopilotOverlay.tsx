@@ -12,9 +12,11 @@ import {
   Play, Pause, Copy, Check, RotateCcw, Send, 
   Key, Cpu, Eye, EyeOff, Sliders, Globe, Code, 
   AlertCircle, CheckCircle2, MessageSquare,
-  Shield, ShieldCheck, ShieldAlert, ShieldOff
+  Shield, ShieldCheck, ShieldAlert, ShieldOff,
+  Zap
 } from 'lucide-react';
 import { normalizeTechnicalSpeech } from '@/lib/speechNormalizer';
+import { FormattedMarkdown } from '@/components/FormattedMarkdown';
 
 export type { AudioSourceMode };
 
@@ -59,6 +61,7 @@ export interface FloatingCopilotOverlayProps {
   onSpeechLangChange?: (lang: string) => void;
   errorMessage?: string | null;
   onDismissError?: () => void;
+  onForceFinishQuestion?: () => void;
 }
 
 export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
@@ -96,7 +99,8 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
   speechLang: propSpeechLang,
   onSpeechLangChange,
   errorMessage,
-  onDismissError
+  onDismissError,
+  onForceFinishQuestion
 }) => {
   // -------------------------------------------------------------
   // 1. Initial State: Start as collapsed circular icon on startup (Option 1)
@@ -120,6 +124,9 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
   const [speechLang, setSpeechLang] = useState<string>(() => propSpeechLang || 'en-IN');
   const [transparency, setTransparency] = useState<number>(75);
   const [fontSize, setFontSize] = useState<'normal' | 'large'>('normal');
+  const [temperature, setTemperature] = useState<number>(0.2);
+  const [maxTokens, setMaxTokens] = useState<number>(280);
+  const [interviewLanguage, setInterviewLanguage] = useState<string>('Java');
 
   // Screen-capture privacy state (Electron BrowserWindow.setContentProtection)
   const [screenProtection, setScreenProtection] = useState<boolean>(false);
@@ -213,6 +220,21 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
       const savedFont = localStorage.getItem('echocopilot_font_size') as any;
       if (savedFont) setFontSize(savedFont);
 
+      const savedTemp = localStorage.getItem('echocopilot_temperature');
+      if (savedTemp) {
+        const parsed = parseFloat(savedTemp);
+        if (!isNaN(parsed)) setTemperature(parsed);
+      }
+
+      const savedTokens = localStorage.getItem('echocopilot_max_tokens');
+      if (savedTokens) {
+        const parsed = parseInt(savedTokens, 10);
+        if (!isNaN(parsed)) setMaxTokens(parsed);
+      }
+
+      const savedInterviewLang = localStorage.getItem('echocopilot_interview_language');
+      if (savedInterviewLang) setInterviewLanguage(savedInterviewLang);
+
       // Load screen-capture privacy setting
       const savedProtection = localStorage.getItem('echocopilot_screen_protection');
       const initialProtection = savedProtection === 'true';
@@ -274,6 +296,9 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
       localStorage.setItem('echocopilot_speech_lang', speechLang);
       localStorage.setItem('echocopilot_transparency', String(transparency));
       localStorage.setItem('echocopilot_font_size', fontSize);
+      localStorage.setItem('echocopilot_temperature', String(temperature));
+      localStorage.setItem('echocopilot_max_tokens', String(maxTokens));
+      localStorage.setItem('echocopilot_interview_language', interviewLanguage);
       localStorage.setItem('echocopilot_screen_protection', String(screenProtection));
     }
     setShowSettings(false);
@@ -376,9 +401,9 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
   const handleCopyFullAnswer = (answer: CopilotAnswer) => {
     const text = [
       `## ${answer.question}`,
-      `**Summary:** ${answer.summary}`,
-      answer.spokenScript ? `**Spoken Script:**\n> "${answer.spokenScript}"` : '',
-      `**Key Points:**\n${(answer.bullets || []).map(b => `- ${typeof b === 'string' ? b : JSON.stringify(b)}`).join('\n')}`,
+      answer.directAnswer || answer.spokenScript ? `**Direct Spoken Answer:**\n> "${answer.directAnswer || answer.spokenScript}"` : '',
+      answer.summary ? `**Supporting Technical Details:**\n${answer.summary}` : '',
+      answer.bullets && answer.bullets.length > 0 ? `**Key Points:**\n${answer.bullets.map(b => `- ${typeof b === 'string' ? b : JSON.stringify(b)}`).join('\n')}` : '',
       answer.codeSnippet ? `\`\`\`${answer.codeSnippet.language}\n${answer.codeSnippet.code}\n\`\`\`` : '',
       answer.tradeoffs && answer.tradeoffs.length > 0 ? `**Trade-offs:**\n${answer.tradeoffs.map(t => `- ${typeof t === 'string' ? t : JSON.stringify(t)}`).join('\n')}` : ''
     ].filter(Boolean).join('\n\n');
@@ -614,20 +639,30 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
                   <span>Listening</span>
                 </span>
+              ) : pipelineStatus === 'speech_detected' ? (
+                <span className="flex items-center gap-1 text-amber-300">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                  <span>Speech detected</span>
+                </span>
               ) : pipelineStatus === 'transcribing' ? (
                 <span className="flex items-center gap-1 text-cyan-400">
                   <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
                   <span>Transcribing</span>
                 </span>
               ) : pipelineStatus === 'generating_answer' ? (
-                <span className="flex items-center gap-1 text-amber-300">
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-spin" />
-                  <span>Answering</span>
+                <span className="flex items-center gap-1 text-sky-300">
+                  <span className="w-2 h-2 rounded-full bg-sky-400 animate-spin" />
+                  <span>Generating</span>
                 </span>
               ) : pipelineStatus === 'answer_ready' ? (
                 <span className="flex items-center gap-1 text-emerald-300">
                   <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  <span>Ready</span>
+                  <span>Answer ready</span>
+                </span>
+              ) : pipelineStatus === 'error' ? (
+                <span className="flex items-center gap-1 text-rose-400">
+                  <span className="w-2 h-2 rounded-full bg-rose-500" />
+                  <span>Audio error</span>
                 </span>
               ) : (
                 <span className="flex items-center gap-1 text-zinc-400">
@@ -744,6 +779,31 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                 </>
               )}
             </button>
+
+            {/* Finish question & Generate now fallback */}
+            {isSessionActive && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (onForceFinishQuestion) {
+                    onForceFinishQuestion();
+                  }
+                  try {
+                    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+                      const bc = new BroadcastChannel('echocopilot_channel');
+                      bc.postMessage({ type: 'FORCE_FINISH_QUESTION' });
+                      bc.close();
+                    }
+                  } catch {}
+                }}
+                style={{ WebkitAppRegion: 'no-drag', pointerEvents: 'auto' } as any}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 transition-all cursor-pointer"
+                title="Finish question & generate answer immediately without waiting for silence"
+              >
+                <Zap className="w-2.5 h-2.5 text-emerald-400" />
+                <span>Generate now</span>
+              </button>
+            )}
 
             {/* Manual Ask Toggle Button */}
             <button
@@ -1095,7 +1155,7 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                   </div>
                   {displayedStreamingText ? (
                     <div className={`text-zinc-100 leading-relaxed font-sans whitespace-pre-wrap ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
-                      {displayedStreamingText}
+                      <FormattedMarkdown content={displayedStreamingText} />
                       <span className="inline-block w-1.5 h-3.5 bg-cyan-400 animate-pulse ml-0.5 rounded-sm align-middle shadow-[0_0_4px_#06b6d4]" />
                     </div>
                   ) : (
@@ -1132,28 +1192,25 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                     )}
                   </div>
 
-                  {/* 1. Summary */}
-                  <div className={`text-zinc-100 font-medium leading-relaxed whitespace-pre-wrap ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
-                    {answer.summary}
-                  </div>
+                  {/* 1. Immediate Direct Speakable Answer (Candidate speaks this immediately) */}
+                  {(answer.directAnswer || answer.spokenScript) && (
+                    <div className={`p-2.5 rounded-lg bg-cyan-950/40 border border-cyan-500/30 shadow-[0_0_12px_rgba(6,182,212,0.12)] text-cyan-100 font-medium leading-relaxed ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
+                      <FormattedMarkdown content={answer.directAnswer || answer.spokenScript || ''} />
+                    </div>
+                  )}
+
+                  {/* 2. Supporting Technical Depth (Summary) */}
+                  {answer.summary && (
+                    <div className={`text-zinc-200 leading-relaxed ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
+                      <FormattedMarkdown content={answer.summary} />
+                    </div>
+                  )}
 
                   {/* Incomplete indicator (if generation was cut off) */}
                   {answer.isIncomplete && (
                     <div className="flex items-center gap-1.5 text-amber-300 text-[10px] mt-1 bg-amber-500/10 border border-amber-500/25 px-2 py-1 rounded">
                       <AlertCircle className="w-3 h-3 shrink-0 text-amber-400" />
                       <span>Response incomplete (generation was interrupted by token limit or stream end)</span>
-                    </div>
-                  )}
-
-                  {/* 2. Spoken Script ("What to say out loud" - only when distinct from summary) */}
-                  {answer.spokenScript && answer.spokenScript.trim() !== answer.summary.trim() && (
-                    <div className="pl-2 border-l-2 border-cyan-400/60 my-1">
-                      <div className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider mb-0.5" style={textShadowStyle}>
-                        What to say out loud
-                      </div>
-                      <p className={`text-cyan-100 leading-relaxed italic ${fontSize === 'large' ? 'text-sm' : 'text-xs'}`} style={textShadowStyle}>
-                        &ldquo;{answer.spokenScript}&rdquo;
-                      </p>
                     </div>
                   )}
 
@@ -1275,7 +1332,7 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
 
                 {/* Ollama Model Selection */}
                 {aiProvider === 'ollama' && (
-                  <div className="space-y-1">
+                  <div className="space-y-1.5">
                     <label className="font-semibold text-zinc-200">Installed Ollama Model</label>
                     <div className="flex gap-2">
                       <select
@@ -1283,8 +1340,8 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                         onChange={(e) => setAiModel(e.target.value)}
                         className="bg-zinc-900 border border-white/10 rounded px-2.5 py-1 text-xs text-zinc-200 flex-1 font-mono focus:outline-none"
                       >
-                        <option value="qwen2.5:3b">qwen2.5:3b (Fast Local)</option>
-                        <option value="llama3.2:1b">llama3.2:1b (Meta LLaMA)</option>
+                        <option value="qwen2.5:3b">qwen2.5:3b (Fast Local - 1.9GB)</option>
+                        <option value="llama3.2:1b">llama3.2:1b (Meta LLaMA - 1.3GB)</option>
                       </select>
                       <input
                         type="text"
@@ -1294,8 +1351,61 @@ export const FloatingCopilotOverlay: React.FC<FloatingCopilotOverlayProps> = ({
                         className="bg-zinc-900 border border-white/10 rounded px-2.5 py-1 text-xs text-zinc-200 w-44 font-mono focus:outline-none"
                       />
                     </div>
+                    <div className="text-[10px] text-zinc-400 leading-tight bg-zinc-900/50 p-1.5 rounded border border-white/5">
+                      <span className="text-zinc-300 font-medium">Hardware:</span> 16GB RAM, RTX 4050 (6GB VRAM). Models up to 7B/8B (e.g. <span className="font-mono text-cyan-300">qwen2.5-coder:7b</span>) fit into VRAM if you install them in Ollama.
+                    </div>
                   </div>
                 )}
+
+                {/* Local Generation Settings */}
+                <div className="grid grid-cols-3 gap-2 pt-1">
+                  <div>
+                    <label className="font-semibold text-zinc-200 block mb-1">Temperature</label>
+                    <input
+                      type="number"
+                      min={0.0}
+                      max={1.0}
+                      step={0.05}
+                      value={temperature}
+                      onChange={(e) => setTemperature(parseFloat(e.target.value) || 0.2)}
+                      className="w-full bg-zinc-900 border border-white/10 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none font-mono"
+                    />
+                    <div className="text-[9px] text-zinc-500 mt-0.5">Default 0.2. Note: low temp reduces randomness but does not guarantee correctness.</div>
+                  </div>
+
+                  <div>
+                    <label className="font-semibold text-zinc-200 block mb-1">Max Tokens</label>
+                    <input
+                      type="number"
+                      min={80}
+                      max={800}
+                      step={20}
+                      value={maxTokens}
+                      onChange={(e) => setMaxTokens(parseInt(e.target.value, 10) || 280)}
+                      className="w-full bg-zinc-900 border border-white/10 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none font-mono"
+                    />
+                    <div className="text-[9px] text-zinc-500 mt-0.5">Concise speakable limit (200-350 tokens).</div>
+                  </div>
+
+                  <div>
+                    <label className="font-semibold text-zinc-200 block mb-1">Context Language</label>
+                    <select
+                      value={interviewLanguage}
+                      onChange={(e) => setInterviewLanguage(e.target.value)}
+                      className="w-full bg-zinc-900 border border-white/10 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none"
+                    >
+                      <option value="Java">Java</option>
+                      <option value="Python">Python</option>
+                      <option value="JavaScript">JavaScript</option>
+                      <option value="TypeScript">TypeScript</option>
+                      <option value="C++">C++</option>
+                      <option value="C">C</option>
+                      <option value="Go">Go</option>
+                      <option value="General">General / Any</option>
+                    </select>
+                    <div className="text-[9px] text-zinc-500 mt-0.5">Defaults technical context.</div>
+                  </div>
+                </div>
 
                 {/* API Key (only if user chooses Groq/OpenAI) */}
                 {(aiProvider === 'groq' || aiProvider === 'openai') && (

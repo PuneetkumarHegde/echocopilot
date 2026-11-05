@@ -1,4 +1,4 @@
-export type ModuleType = 'copilot' | 'mock' | 'resume' | 'questions' | 'history';
+export type ModuleType = 'copilot' | 'profile' | 'projects' | 'mock' | 'resume' | 'questions' | 'history';
 
 export type AnswerMode = 'coding' | 'system_design' | 'behavioral' | 'general';
 
@@ -9,7 +9,8 @@ export type AnswerTriggerPolicy = 'meeting_only' | 'mic_only' | 'both';
 export type AudioPipelineStatus = 
   | 'idle' 
   | 'listening' 
-  | 'paused' 
+  | 'speech_detected'
+  | 'paused'
   | 'transcribing' 
   | 'question_detected'
   | 'generating_answer' 
@@ -41,6 +42,7 @@ export interface CopilotAnswer {
   id: string;
   question: string;
   mode: AnswerMode;
+  directAnswer?: string;
   summary: string;
   spokenScript?: string;
   bullets: string[];

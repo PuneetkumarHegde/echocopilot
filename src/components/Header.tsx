@@ -2,7 +2,11 @@
 
 import React from 'react';
 import { ModuleType } from '@/lib/types';
-import { Mic, Headphones, FileText, Database, History, Sparkles, Cpu } from 'lucide-react';
+import { ActiveContextSelector } from '@/components/ActiveContextSelector';
+import { 
+  Mic, Headphones, FileText, Database, History, 
+  Sparkles, Cpu, User, FolderGit2 
+} from 'lucide-react';
 
 interface HeaderProps {
   activeModule: ModuleType;
@@ -19,7 +23,9 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const navItems: { id: ModuleType; label: string; icon: React.ReactNode; badge?: string }[] = [
     { id: 'copilot', label: 'Live AI Copilot', icon: <Mic className="w-4 h-4" />, badge: isCopilotActive ? 'LIVE' : undefined },
-    { id: 'mock', label: 'Mock Interview', icon: <Headphones className="w-4 h-4" /> },
+    { id: 'profile', label: 'Career Profile', icon: <User className="w-4 h-4" /> },
+    { id: 'projects', label: 'Project Vault', icon: <FolderGit2 className="w-4 h-4" /> },
+    { id: 'mock', label: 'Practice Studio', icon: <Headphones className="w-4 h-4" /> },
     { id: 'resume', label: 'Resume Analyzer', icon: <FileText className="w-4 h-4" /> },
     { id: 'questions', label: 'Question Bank', icon: <Database className="w-4 h-4" /> },
     { id: 'history', label: 'Session History', icon: <History className="w-4 h-4" /> }
@@ -39,10 +45,10 @@ export const Header: React.FC<HeaderProps> = ({
             <div className="flex items-center gap-2">
               <span className="font-bold text-lg text-zinc-100 tracking-tight">EchoCopilot</span>
               <span className="text-[10px] font-semibold tracking-wider uppercase px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                AI Assistant
+                Career & Interview Copilot
               </span>
             </div>
-            <p className="text-[11px] text-zinc-400 font-medium hidden sm:block">Real-Time Interview & Meeting Copilot</p>
+            <p className="text-[11px] text-zinc-400 font-medium hidden sm:block">Real-Time Interview & Project-Aware AI Assistant</p>
           </div>
         </div>
 
@@ -73,13 +79,19 @@ export const Header: React.FC<HeaderProps> = ({
           })}
         </nav>
 
-        {/* Provider Status Pill */}
-        <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-full bg-zinc-900/60 border border-zinc-800/90 text-xs text-zinc-400">
-          <Cpu className="w-3.5 h-3.5 text-emerald-400" />
-          <span className="text-zinc-300 font-mono text-[11px] truncate max-w-[170px]" title={activeProvider}>
-            {activeProvider}
-          </span>
-          <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+        {/* Right Header Status Bar (Active Context + Engine Pill) */}
+        <div className="flex items-center gap-2.5">
+          {/* Active Career Context Selector */}
+          <ActiveContextSelector />
+
+          {/* Provider Status Pill */}
+          <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-full bg-zinc-900/60 border border-zinc-800/90 text-xs text-zinc-400">
+            <Cpu className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="text-zinc-300 font-mono text-[11px] truncate max-w-[140px]" title={activeProvider}>
+              {activeProvider}
+            </span>
+            <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+          </div>
         </div>
       </div>
     </header>

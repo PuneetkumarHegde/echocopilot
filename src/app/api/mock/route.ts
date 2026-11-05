@@ -1,14 +1,65 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { evaluateMockAnswer, generateFinalMockReport } from '@/lib/aiFallback';
+import { generatePersonalizedQuestions, evaluatePracticeAnswer } from '@/lib/personalizedEngine';
 import { MockTurnFeedback } from '@/lib/types';
+import { UserProfile, ProjectRecord, TargetJobDescription } from '@/lib/profileTypes';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { action, role = 'Full-Stack Engineer', difficulty = 'Senior', question, userAnswer, turnIndex = 1, turns = [] } = body;
+    const { 
+      action, 
+      role = 'Full-Stack Engineer', 
+      difficulty = 'Senior', 
+      question, 
+      userAnswer, 
+      turnIndex = 1, 
+      turns = [],
+      track,
+      profile,
+      projects = [],
+      targetJob,
+      resumeText
+    } = body;
 
-    // 1. Generate Interview Questions
+    // 1. Generate Interview Questions (Personalized & Track-Aware)
     if (action === 'generate_questions') {
+      // If personalized context is passed or a specific practice track is selected
+      if (profile || (projects && projects.length > 0) || track) {
+        const pQuestions = generatePersonalizedQuestions(
+          profile as UserProfile,
+          projects as ProjectRecord[],
+          targetJob as TargetJobDescription | undefined,
+          resumeText
+        );
+
+        let filtered = pQuestions;
+        if (track === 'hr') {
+          filtered = pQuestions.filter(q => q.category === 'Career & Motivation' || q.category === 'Behavioral & Leadership');
+        } else if (track === 'technical') {
+          filtered = pQuestions.filter(q => q.category === 'Tech Choice Rationale' || q.category === 'System Architecture & Trade-offs' || q.category === 'General Technical');
+        } else if (track === 'project_deep_dive') {
+          filtered = pQuestions.filter(q => q.category === 'Verified Contributions' || q.category === 'Difficult Bugs & Outages' || q.category === 'Rebuilding & Future Vision' || q.source === 'project');
+        } else if (track === 'resume') {
+          filtered = pQuestions.filter(q => q.category === 'Verified Contributions' || q.category === 'Career & Motivation' || q.source === 'profile');
+        } else if (track === 'job_description') {
+          filtered = pQuestions.filter(q => q.source === 'job_description' || q.category === 'Tech Choice Rationale');
+        }
+
+        // Fallback to all if filter is too narrow
+        if (filtered.length === 0) filtered = pQuestions;
+
+        return NextResponse.json({
+          questions: filtered.slice(0, 6).map(q => ({
+            id: q.id,
+            question: q.question,
+            category: q.category,
+            context: q.contextSnippet
+          }))
+        });
+      }
+
+      // Legacy fallback questions by role
       const questionsByRole: Record<string, string[]> = {
         'Frontend Engineer': [
           'Can you explain how the React Virtual DOM diffing algorithm works, and how keys optimize list reconciliation?',
@@ -47,12 +98,25 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 2. Evaluate Candidate Answer
+    // 2. Evaluate Candidate Answer (4-Rubric: Correctness, Clarity, Relevance, Confidence)
     if (action === 'evaluate') {
       if (!userAnswer || !question) {
         return NextResponse.json({ error: 'Question and userAnswer are required for evaluation' }, { status: 400 });
       }
 
+      if (profile && projects) {
+        const feedback = evaluatePracticeAnswer(
+          question,
+          userAnswer,
+          turnIndex,
+          track || 'technical',
+          profile as UserProfile,
+          projects as ProjectRecord[]
+        );
+        return NextResponse.json({ feedback });
+      }
+
+      // Legacy fallback
       const feedback: MockTurnFeedback = evaluateMockAnswer(question, userAnswer, turnIndex);
       return NextResponse.json({ feedback });
     }

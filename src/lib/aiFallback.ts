@@ -1,6 +1,19 @@
 import { AnswerMode, CopilotAnswer, MockTurnFeedback, MockInterviewReport, ResumeAnalysisResult } from './types';
-import { classifyUtterance, QuestionCategory, isDualConceptComparison } from './questionClassifier';
+import { 
+  classifyUtterance, 
+  QuestionCategory, 
+  isDualConceptComparison, 
+  ConversationTurnSummary,
+  extractQuestionAndContext,
+  splitUtteranceSentences
+} from './questionClassifier';
 import { normalizeTechnicalTerms } from './technicalTermNormalizer';
+import { classifyQuestionIntent } from './intentClassifier';
+import { generateStructuredComparison, isKnownComparison } from './comparisonEngine';
+import { generateTechnicalAnswer } from './technicalEngine';
+import { generatePersonalizedAnswer } from './personalizedEngine';
+import { INITIAL_USER_PROFILE, INITIAL_PROJECTS } from './storage';
+import { validateFactualClaims } from './answerValidator';
 
 /**
  * Builds tailored prompt instructions based on the question type and mandatory answer rules:
@@ -74,12 +87,12 @@ Instead, your very first sentence MUST clarify that this term is not standard in
    [Accurate definition of Concept B in 1–2 concise sentences.]
 
    **Key Differences**
-   - **Purpose:** [Distinction between Concept A and Concept B purpose]
-   - **Parameters / Signatures:** [Distinction in parameters, signatures, or core mechanism]
-   - **Polymorphism / Behavior:** [Distinction in runtime vs compile-time behavior, execution timing, or practical trade-offs]
+   - **Core Purpose & Mechanism:** [Distinction between Concept A and Concept B operation, role, or architecture]
+   - **Execution & Scope:** [Distinction in execution environment, invocation, or local vs remote scope]
+   - **Practical Application & Trade-offs:** [When to use Concept A vs Concept B and engineering trade-offs]
 
    **Example**
-   [Short practical example or minimal compilable code only when useful. Do not repeat definitions in the example explanation.]
+   [Short practical example, minimal code, or command workflow only when useful. Do not repeat definitions in the example explanation.]
 
    **Interview Summary**
    [1–2 sentence crisp closing contrast summary.]
@@ -135,12 +148,12 @@ Use this exact layered structure:
 [Accurate definition of Concept B in 1–2 concise sentences.]
 
 **Key Differences**
-- **Purpose:** [Distinction between Concept A and Concept B purpose]
-- **Parameters / Signatures:** [Distinction in parameters, signatures, or core mechanism]
-- **Polymorphism / Behavior:** [Distinction in runtime vs compile-time behavior, or practical trade-offs]
+- **Core Purpose & Mechanism:** [Distinction between Concept A and Concept B operation, role, or architecture]
+- **Execution & Scope:** [Distinction in execution environment, invocation, or local vs remote scope]
+- **Practical Application & Trade-offs:** [When to use Concept A vs Concept B and engineering trade-offs]
 
 **Example**
-[Short practical example or minimal compilable code only when useful. Do not repeat definitions in example explanation.]
+[Short practical example, minimal code, or command workflow only when useful. Do not repeat definitions in example explanation.]
 
 **Interview Summary**
 [1–2 sentence crisp closing contrast summary.]
@@ -229,6 +242,471 @@ function isSectionHeading(line: string): {
 }
 
 /**
+ * Strips all introductory meta-phrases, labels, markdown headers, and formatting
+ * so that the candidate immediately receives pure, speakable words suitable to say aloud.
+ */
+/**
+ * Strips all introductory meta-phrases, labels, markdown headers, and formatting
+ * so that the candidate immediately receives pure, speakable words suitable to say aloud.
+ * Preserves a complete 4–6 sentence interview-ready answer (~70–130 words, 20–40s spoken time).
+ */
+export function cleanDirectSpeakableAnswer(raw: string): string {
+  if (!raw) return '';
+  let text = raw.trim();
+
+  // Strip markdown code fences if present
+  text = text.replace(/```(?:json)?\s*[\s\S]*?```/gi, '').trim();
+
+  // Strip markdown headers at the start and throughout
+  text = text.replace(/^#+\s*(?:\d+\.?\s*)?(?:Direct Interview Answer|Direct Answer|Interview Answer|Summary|Definition|Answer|Core Concept|Level 1[^\n]*)[^\n]*\n+/i, '');
+  text = text.replace(/^#+\s+[^\n]+\n+/gi, '');
+
+  // Strip common introductory labels (e.g. "**Direct Interview Answer:**", "**Summary:**", "**Definition:**", "Summary:", "Answer:")
+  text = text.replace(/^(?:\*\*|\*|__)?(?:Direct Interview Answer|Direct Answer|Interview Answer|Summary|Definition|Answer|What to say out loud|Spoken Script|Candidate Answer|In plain English|In simple terms|Level 1 — Complete Speakable Answer|Level 1)[:\s\-—]*(?:\*\*|\*|__)?[:\s\-—]*/i, '');
+  text = text.replace(/^(?:\*\*|\*|__)\s*/, '');
+
+  // Strip conversational filler openers
+  const fillerPatterns = [
+    /^(?:Certainly|Sure|Absolutely|Of course|Definitely)[,!.\s]+/i,
+    /^(?:Here is|Here's) (?:a direct|an|the|a concise|a quick) (?:answer|explanation|definition|breakdown|summary)[^:.]*[:.]\s*/i,
+    /^(?:Let's|Let us) (?:understand|dive into|explore|look at|break down)[^:.]*[:.]\s*/i,
+    /^(?:In an interview|When asked this|To answer this question)[^,.:]*[,.:]\s*/i,
+    /^(?:Great question|Good question|Thanks for asking)[,!.\s]+/i
+  ];
+  for (const pat of fillerPatterns) {
+    text = text.replace(pat, '').trim();
+  }
+
+  // Strip leading outer quotes or asterisks
+  text = text.replace(/^["'“`]+|["'”`]+$/g, '').trim();
+  if (text.startsWith('**') && text.endsWith('**') && (text.match(/\*\*/g) || []).length === 2) {
+    text = text.slice(2, -2).trim();
+  }
+
+  // If text starts with a bullet point, strip it
+  text = text.replace(/^[-*•]\s+/, '').trim();
+
+  // Unescape literal \n and \" if raw string arrived encoded from JSON
+  text = text.replace(/\\n/g, '\n').replace(/\\"/g, '"');
+
+  // Filter out any lines or sections that look like markdown tables, code blocks, or section headers
+  const cleanParagraphs = text
+    .split(/\n\s*\n/)
+    .map(p => p.trim())
+    .filter(p => {
+      if (!p) return false;
+      if (p.startsWith('#')) return false;
+      if (p.startsWith('|')) return false;
+      if (p.startsWith('```')) return false;
+      if (p.startsWith('---')) return false;
+      return true;
+    });
+
+  if (cleanParagraphs.length > 0) {
+    // Preserve paragraph breaks (\n\n) between distinct comparison points and sentences
+    text = cleanParagraphs.slice(0, 10).join('\n\n').trim();
+  }
+
+  // Ensure clean termination
+  text = text.replace(/^["'“`]+|["'”`]+$/g, '').trim();
+  if (text && !/[.!?]$/.test(text)) {
+    text += '.';
+  }
+
+  return text;
+}
+
+/**
+ * Cleans the Stage 2 supporting summary so it does NOT repeat the Stage 1 direct answer
+ * or begin with direct interview answer headers.
+ */
+export function cleanSupportingSummary(raw: string, directAnswer?: string): string {
+  if (!raw) return '';
+  let text = raw.trim();
+
+  // Strip introductory direct answer labels or direct answer sections
+  text = text.replace(/^#+\s*(?:\d+\.?\s*)?(?:Direct Interview Answer|Direct Answer|Interview Answer|Spoken Script|Level 1[^\n]*)[^\n]*\n+/i, '');
+  text = text.replace(/^(?:\*\*|\*|__)?(?:Direct Interview Answer|Direct Answer|Interview Answer|Level 1[^\n]*)(?:\*\*|\*|__)?[:\s\-—]*[^\n]+\n+/i, '');
+
+  // Strip horizontal separator at top if present
+  text = text.replace(/^---\s*\n+/, '');
+
+  // If the direct answer is repeated word-for-word at the very top, strip it
+  if (directAnswer && directAnswer.length > 20) {
+    const cleanDA = directAnswer.trim().toLowerCase();
+    const topLines = text.slice(0, cleanDA.length + 50).toLowerCase();
+    if (topLines.includes(cleanDA.slice(0, 30))) {
+      // Only strip if it's an unheaded opening duplicate or explicit Direct Answer section,
+      // NOT when it's an intentionally formatted **Definition** or **[Concept] — Definition** section
+      if (!/^\s*\*\*(?:[^*]+(?:\s*—\s*|\s*-\s*))?Definition\*\*/i.test(text)) {
+        const idx = text.toLowerCase().indexOf(cleanDA);
+        if (idx !== -1 && idx < 50) {
+          text = text.substring(idx + directAnswer.length).trim();
+          text = text.replace(/^[:\s\-—]+/, '').replace(/^---\s*\n+/, '').trim();
+        }
+      }
+    }
+  }
+
+  return text.trim();
+}
+
+// -------------------------------------------------------------
+// Baseline Technical & Conceptual Interview Assistant System Prompt
+// -------------------------------------------------------------
+
+export const TECHNICAL_INTERVIEW_SYSTEM_PROMPT = `You are EchoCopilot, an expert AI interview assistant attending an interview.
+Your answers must sound like a knowledgeable candidate explaining a concept to an interviewer across ANY subject or domain.
+
+1. GENERAL ANSWERING STYLE:
+   - Sound like a knowledgeable candidate speaking directly to an interviewer. Use natural, conversational, professional English.
+   - Write complete, meaningful sentences. Explain concepts thoroughly rather than simply listing keywords or shorthand fragments.
+   - Start directly with the answer—STRICTLY ZERO conversational filler ("Certainly!", "Great question!") and STRICTLY ZERO introductory labels ("Summary:", "Direct Answer:", "Definition:").
+   - Use logical transitions between explanations. Explain technical terms when necessary.
+   - Include relevant examples to make concepts understandable. Avoid textbook-like fragments and disconnected bullet points.
+   - Avoid unnecessary introductions and repetitive conclusions. Do not artificially increase answer length.
+   - The candidate must be able to understand and confidently explain this answer verbally.
+
+2. PRESERVE THE TWO-STAGE ANSWER FORMAT:
+   - Stage 1 – Short Interview Answer:
+     * Start with a direct response in approximately 2–4 natural sentences (70–130 words).
+     * Explain the main idea clearly. Independently useful as an immediate interview response.
+     * Displayed quickly without waiting for the detailed explanation.
+   - Stage 2 – Detailed Explanation:
+     * Continue underneath with a complete, in-depth explanation.
+     * Cover all important properties, types, classifications, mechanisms, rules, and related concepts where relevant.
+     * Explain how and why things work. Include practical examples, code, or calculations with outputs and explanations.
+     * Discuss relevant applications, limitations, and exceptions. Do not repeat Stage 1 unnecessarily.
+
+3. SPECIAL RULE FOR DIFFERENCE AND COMPARISON QUESTIONS (X vs Y):
+   Whenever asked about differences, comparisons, or distinctions:
+   A. Define both concepts first: Explain what Concept A means and what Concept B means. Do not assume the interviewer already knows their definitions.
+   B. Explain their important properties: Describe characteristics, purpose, working, and relevant behavior of both concepts.
+   C. Explain the differences naturally: Compare using complete, speakable sentences with conversational transitions:
+      e.g. "First, regarding size, an array has a fixed length, meaning we cannot change its length after creation. On the other hand, an ArrayList is dynamically resizable, so we can add or remove elements as needed."
+      "Another difference is their data type support. An array can store primitive values as well as object references, whereas ArrayList stores objects..."
+      "Regarding implementation, an array stores elements in a fixed-length array, while ArrayList internally uses a resizable array."
+   D. Explain examples: Provide a practical example or code example with line explanations and output.
+   E. Explain when to use each: Conclude with a practical explanation of when one concept is more suitable than the other.
+   CRITICAL NEGATIVE CONSTRAINTS:
+   - Do NOT make a comparison table the primary explanation!
+   - Do NOT put essential information only inside table cells!
+   - Do NOT generate short labels like "Fixed size", "Dynamic size", "Fast", or "Slow" without explaining their meaning!
+   - The candidate must be able to speak the entire comparison naturally without needing to convert a table into sentences.
+   - A small summary table may be added at the end only when it provides additional value. It must NEVER replace the spoken explanation.
+
+4. RULE FOR DEFINITION AND CONCEPT QUESTIONS:
+   Explain systematically:
+   1. Definition: What does the concept mean?
+   2. Purpose: Why does it exist or why is it used?
+   3. Working: How does it work?
+   4. Properties: What are its important characteristics?
+   5. Types or classifications: Explain relevant categories.
+   6. Examples: Demonstrate how it works.
+   7. Applications: Explain where and why it is used.
+   8. Related concepts: Explain important connections or distinctions.
+   Select relevant sections according to question scope. Do not force irrelevant information into narrow questions.
+
+5. RULE FOR TYPES AND CLASSIFICATIONS:
+   When a concept has important types or classifications, explain them instead of merely listing their names.
+   For each relevant type: Define it, Explain its purpose, Explain how it works, Give examples, and Explain how it differs from other types. (Never stop after saying "There are three types.")
+
+6. RULE FOR HOW AND WHY QUESTIONS:
+   - How: Explain the process in logical order, describe important components, explain what happens at each stage, provide a practical example, and explain the result.
+   - Why: Identify the underlying reason, explain the mechanism behind it, give an example or scenario, and explain relevant consequences.
+
+7. RULE FOR PROGRAMMING AND CODING QUESTIONS:
+   Explain the concept, approach/implementation, provide correct minimal code, explain important lines, show expected output, explain execution flow, include time and space complexity for algorithmic problems, and discuss edge cases. Never provide code without explaining what it does.
+
+8. RULE FOR ALL OTHER SUBJECTS (NON-PROGRAMMING):
+   Apply the same natural explanation principles to EVERY domain:
+   - Science: Principles, mechanisms, formulas, and applications.
+   - Mathematics: Concepts, derivations, calculations, and steps.
+   - Business & Management: Processes, principles, decisions, and examples.
+   - Finance & Economics: Concepts, calculations, assumptions, and risks.
+   - History: Events, chronology, causes, and consequences.
+   - Healthcare & Medicine: Concepts, mechanisms, and appropriate limitations.
+   - Law: Principles, jurisdiction, and distinctions.
+   Never assume every question is about programming or technology. Adapt content to the subject without forcing programming code blocks.
+
+9. ANSWER COMPLETENESS AND ACCURACY:
+   Accurate explanation over unnecessary length. Never invent facts, technical details, complexity claims, or examples. Ground all claims in verified principles.
+
+10. FORMATTING RULE:
+    Use natural paragraphs with meaningful headings.
+    - Numbered lists for sequential steps.
+    - Bullet points for genuinely independent items.
+    - Tables ONLY for compact summaries or supplementary comparisons at the end.
+    - Code blocks for code; formulas for mathematical explanations where appropriate.
+    - Do NOT turn every answer into a table. Do NOT make the candidate read table cells aloud to explain a concept.`;
+
+/**
+ * Builds the prompt payload for the single-pass interview assistant pipeline.
+ * Pairs follow-ups with prior turn context to preserve conversational continuity.
+ */
+export function buildInterviewAssistantPrompt(
+  question: string,
+  contextHistory?: Array<{ question: string; summary: string }>,
+  configuredLanguage: string = 'Java'
+): { systemPrompt: string; userPrompt: string } {
+  const cleanQ = question.trim();
+  let userPrompt = cleanQ;
+
+  // Decompose into scenario context and question
+  const extracted = extractQuestionAndContext(cleanQ);
+  if (extracted.hasQuestion && extracted.context && extracted.questions.length > 0) {
+    let contextBody = extracted.context;
+    // Token budget management: if scenario context is very long (>1500 chars), prune filler while preserving technical constraints
+    if (contextBody.length > 1500) {
+      const sentences = splitUtteranceSentences(contextBody);
+      const filtered = sentences.filter(s => {
+        const lower = s.toLowerCase();
+        return /\b(require|need|must|constraint|traffic|load|latency|scale|rate|database|service|security|auth|fail|concurrent|query|memory|cache)\b/i.test(lower);
+      });
+      contextBody = filtered.length > 0 ? filtered.join(' ') : sentences.slice(-3).join(' ');
+    }
+    userPrompt = `Interviewer Context & Scenario:\n"${contextBody}"\n\nInterviewer Question:\n"${extracted.questions.join(' ')}"`;
+  } else if (contextHistory && contextHistory.length > 0) {
+    // If question is a contextual follow-up, include immediate parent turn so the model knows context
+    const parent = contextHistory[0];
+    const isFollowUpPattern = /^(explain that|why\??|how come\??|which one|which should i use|give (a |an )?(small )?code|show code|what about|could you elaborate|can you elaborate|what is the (time |space )?complexity|how does that work|does it shrink|does its capacity shrink)\b/i.test(cleanQ);
+    if (isFollowUpPattern || cleanQ.split(/\s+/).length <= 6) {
+      userPrompt = `Previous context:\nQuestion: "${parent.question}"\nAnswer summary: "${parent.summary}"\n\nFollow-up question: "${cleanQ}"`;
+    }
+  }
+
+  // Detect format overrides & constraints
+  const isTwoSentences = /two sentences|2 sentences|briefly|in two sentences|in 2 sentences|one sentence|1 sentence/i.test(cleanQ);
+  const isNoCode = /no code|without code/i.test(cleanQ);
+  const isCodeOnly = /code example|show code|write code|give (a |an )?(small )?code/i.test(cleanQ);
+  const isComparison = /difference between|compare|\bvs\b|versus/i.test(cleanQ);
+
+  // Common programming languages check
+  const commonLangs = ['java', 'python', 'javascript', 'typescript', 'c++', 'golang', 'c#', 'rust', 'sql'];
+  const hasNamedLang = commonLangs.some(lang => userPrompt.toLowerCase().includes(lang));
+
+  // Detect non-programming subjects (Physics, Chemistry, Biology, Economics, General Theory)
+  const isNonProgramming = /inflation|deflation|gdp|monetary policy|fiscal policy|photosynthesis|newton|laws of motion|thermodynamics|mitosis|meiosis|dna|respiration|supply and demand|macroeconomic|microeconomic|gravity|relativity/i.test(cleanQ) ||
+    (!hasNamedLang && !isCodeOnly && !/\b(code|programming|java|python|javascript|typescript|c\+\+|golang|sql|react|node|api|database|query|thread|memory|class|interface|function|method|algorithm|docker|kubernetes|git|http|tcp|udp)\b/i.test(cleanQ));
+
+  // Detect narrow/specific error or concept questions
+  const isSpecificConcept = /nullpointer|null pointer|stackoverflowerror|outofmemoryerror|concurrentmodification|arrayindexoutofbounds|classnotfound|nosuchmethod|indexoutofbound/i.test(cleanQ);
+
+  // Detect How / Why process questions
+  const isHowOrWhy = /^(how|why)\b|how does|why does|how do|why do|how to|why is|how is|how would you|how can/i.test(cleanQ) && !isComparison;
+
+  let formatInstructions = '';
+  if (isTwoSentences || isNoCode) {
+    formatInstructions = `\n(Constraint: Answer strictly in approximately two short spoken sentences. Do NOT output code, tables, or markdown headings.)`;
+  } else if (isCodeOnly) {
+    formatInstructions = `\n(Constraint: Provide a minimal, clean code example in ${configuredLanguage} (6-12 lines) with required imports if applicable, followed by one short sentence explaining it.)`;
+  } else if (isComparison) {
+    formatInstructions = `\nDEFAULT COMPARISON FORMAT:
+### Interview Answer
+[A natural, speakable opening in approximately 2–4 natural sentences (70–130 words). Start directly by identifying that both concepts belong to the domain but differ in several key ways. Independently useful as an immediate interview answer without conversational filler or labels.]
+
+### Definitions & Core Properties
+[Define Concept A clearly, explain its purpose, and describe its fundamental working behavior and properties.
+Then define Concept B clearly, explain its purpose, and describe its fundamental working behavior and properties.
+Do not assume the interviewer already knows their definitions.]
+
+### Key Differences Explained Naturally
+[Compare the concepts across important dimensions using complete, speakable sentences with natural transitions.
+Follow this conversational candidate speaking style:
+"First, regarding [dimension], [Concept A] is [explanation of Concept A], whereas [Concept B] is [explanation of Concept B]."
+"Second, regarding [dimension], [explain both sides clearly]."
+"Another difference is [dimension]. [Explain both sides clearly]."
+"Regarding [dimension], [explain both sides clearly]."
+"Finally, regarding [dimension]..."
+Explain the practical meaning of every distinction—never output bare disconnected labels like "Fast" or "Fixed size" without explaining why. Do NOT make a table the primary explanation; write out full, speakable paragraphs.]
+
+### Practical Examples & Demonstration
+[Provide a clear practical example or compilable code example showing both concepts in action. Explain the code, critical lines, execution flow, and expected output.]
+
+### When to Use Each & Engineering Trade-Offs
+[Conclude with a practical explanation of when one concept is more suitable than the other, real-world engineering trade-offs, and typical use cases.]
+
+### Summary Comparison Table
+| Dimension | Concept 1 | Concept 2 |
+| :--- | :--- | :--- |
+[A compact supplementary reference table summarizing the key dimensions above. This serves only as an optional quick reference; it must never replace the spoken explanation above.]`;
+  } else if (isHowOrWhy) {
+    formatInstructions = `\nHOW / WHY EXPLANATION FORMAT:
+### Interview Answer
+[A direct, natural answer in approximately 2–4 sentences (70–130 words) explaining the core mechanism or fundamental reason directly. Speakable immediately without labels or filler.]
+
+### Underlying Mechanism & Core Components
+[Explain the underlying reason or system architecture in logical order. Describe important components, their roles, and why the system behaves this way.]
+
+### Step-by-Step Execution Flow
+[Use a numbered list or sequential paragraphs to walk through the exact process at each stage from initiation to completion.]
+
+### Practical Example & Demonstration
+[Provide a concrete code example, calculation, or practical scenario demonstrating the mechanism in action. Explain the example, execution flow, and the result.]
+
+### Consequences, Edge Cases & Best Practices
+[Explain the practical implications, common pitfalls, edge cases, and engineering best practices related to this mechanism.]`;
+  } else if (isNonProgramming) {
+    formatInstructions = `\nNON-PROGRAMMING CONCEPT FORMAT:
+### Interview Answer
+[A natural, speakable opening in approximately 2–4 natural sentences (70–130 words). State the core definition, primary purpose or governing principle, and practical significance. Speakable immediately without conversational filler or introductory labels.]
+
+### Definition, Core Principles & Governing Mechanisms
+[Explain what the concept means, the underlying mechanisms, laws, equations, or economic/biological drivers, and how it functions step-by-step.]
+
+### Types, Stages & Classifications Explained
+[Cover essential categories, stages, laws, or variants relevant to the concept. Explain each one thoroughly (what it means, how it works, and its significance) rather than merely listing terms.]
+
+### Real-World Examples & Calculations
+[Provide concrete real-world scenarios, practical calculations, or process walkthroughs illustrating the concept in action with step-by-step results.]
+
+### Applications, Significance & Limitations
+[Explain the broader implications, practical applications, boundary conditions, exceptions, and limitations.]`;
+  } else if (isSpecificConcept) {
+    formatInstructions = `\nSPECIFIC CONCEPT / ERROR EXPLANATION FORMAT:
+### Interview Answer
+[A natural, speakable opening in approximately 2–4 natural sentences (70–130 words). Define the specific concept/exception, when and why it occurs at runtime, and the primary way to prevent or resolve it.]
+
+### Root Causes & Trigger Conditions
+[Detailed breakdown of the exact operations, runtime conditions, and programming scenarios that trigger this specific issue. Note its position in the hierarchy where relevant.]
+
+### Practical Code Example & Demonstration
+\`\`\`${configuredLanguage.toLowerCase()}
+// Minimal code illustrating the trigger and the clean resolution
+\`\`\`
+[Concise explanation of why the issue occurs and how the fix works.]
+
+### Prevention Strategies, Edge Cases & Modern Best Practices
+[Defensive programming techniques, modern language APIs/features (e.g. Optional, Objects.requireNonNull, annotations), and production debugging advice.]`;
+  } else {
+    formatInstructions = `\nDEFAULT TECHNICAL CONCEPT FORMAT:
+### Interview Answer
+[A natural, speakable opening in approximately 2–4 natural sentences (70–130 words). State the core definition, primary purpose, and high-level working. Speakable immediately without conversational filler or introductory labels.]
+
+### Definition, Purpose & Hierarchy
+[Explain what the concept means, why it exists, what problem it solves, and its place in the broader architectural or conceptual hierarchy.]
+
+### How It Works & Core Properties
+[Explain the internal working and mechanisms step-by-step. Describe its essential properties, rules, and operational characteristics.]
+
+### Types & Classifications Explained
+[When relevant types or categories exist, explain each type individually (definition, purpose, how it works, and how it differs from others) rather than just listing their names. If the concept has no sub-types, explain its core components.]
+
+### Practical & Code Example
+\`\`\`${configuredLanguage.toLowerCase()}
+// Minimal, clean, compilable illustrative code or query workflow (6–15 lines)
+\`\`\`
+[Concise line-by-line explanation of critical lines, execution flow, and expected output.]
+
+### Applications, Best Practices & Limitations
+[Explain real-world engineering use cases, limitations, common pitfalls to avoid, and performance implications.]`;
+  }
+
+  // If programming language is configured and not explicitly named in the prompt, provide language hint (only for programming questions)
+  if (!isNonProgramming && !hasNamedLang && configuredLanguage) {
+    userPrompt += `\n(Configured interview language: ${configuredLanguage})`;
+  }
+
+  if (formatInstructions) {
+    userPrompt += `\n${formatInstructions}`;
+  }
+
+  return {
+    systemPrompt: TECHNICAL_INTERVIEW_SYSTEM_PROMPT,
+    userPrompt
+  };
+}
+
+/**
+ * Builds the ultra-focused Stage 1 prompt for immediate, speakable candidate response.
+ */
+export function buildStage1Prompt(prompt: string, category: QuestionCategory = 'GENERAL'): string {
+  return `You are EchoCopilot, an AI interview assistant attending a technical interview.
+Task: Answer this question exactly as a real candidate responding naturally, professionally, and confidently to an interviewer.
+
+CRITICAL INSTRUCTIONS BY QUESTION TYPE:
+
+1. FOR COMPARISON QUESTIONS ("difference between X and Y", "compare X and Y", "X vs Y"):
+   - Start with ONE natural introductory sentence identifying that both concepts belong to the domain but differ in several key ways.
+   - Explain each important difference separately (aim for 5 to 7 key differences).
+   - Format each difference point with natural transitions and bold dimension labels:
+     **First, [dimension]:** [Explain both sides of the comparison clearly in the same point].
+
+     **Second, [dimension]:** [Explain both sides clearly].
+
+     **Third, [dimension]:** [Explain both sides clearly].
+
+     **Finally, [usage / conclusion dimension]:** [Explain both sides clearly].
+   - MANDATORY: Leave ONE BLANK LINE between consecutive points. Do not put the entire answer into one long paragraph.
+   - Conclude with a natural closing sentence: "That's the main difference between [Concept A] and [Concept B]."
+
+2. FOR DEFINITION / CONCEPT QUESTIONS ("What is X?", "Explain X"):
+   - Start with a clear, direct definition.
+   - Explain its purpose and how it works under the hood in a natural conversational flow.
+   - Give a relevant practical example or real-world application.
+
+3. FOR HOW AND WHY QUESTIONS:
+   - Start with the direct answer.
+   - Explain the working or reasoning in a logical sequence.
+   - Include a practical example.
+
+4. FOR PROGRAMMING QUESTIONS:
+   - Explain the approach first.
+   - Provide minimal, correct compilable code.
+   - Explain the important logic and include complexity.
+
+5. FOR DSA QUESTIONS:
+   - Start with the approach.
+   - Explain the algorithm.
+   - State time/space complexity and cover key edge cases.
+
+6. FOR HR AND BEHAVIORAL QUESTIONS:
+   - Use natural first-person language ("I", "in my experience").
+   - Give realistic, interview-ready responses using STAR structure naturally.
+
+STRICT SPEAKABLE INTERVIEW-ANSWER RULES:
+- Sound like a real candidate speaking aloud: natural, conversational, professional, and technically accurate.
+- Deliver a complete 4 to 6 natural sentences speakable answer (or 5 to 7 comparison points, 70–130 words budget for definitions).
+- DO NOT generate study notes, bulleted summaries, or textbook lectures.
+- STRICTLY NO conversational filler openers ("Certainly!", "Sure!", "Here is the answer", "Let's understand this", "In an interview...").
+- STRICTLY NO headings and labels like "Summary:", "Direct Answer:", "Definitions:", "Key Points:".
+- End cleanly with proper terminal punctuation.
+
+Interview Question: ${prompt}`;
+}
+
+/**
+ * Builds the Stage 2 prompt for progressive supporting technical depth (Stage 2 & Stage 3).
+ */
+export function buildStage2Prompt(prompt: string, directAnswer: string, category: QuestionCategory = 'GENERAL'): string {
+  return `You are EchoCopilot, providing progressive technical depth (Level 2: Supporting Technical Depth & Level 3: Additional Technical Depth) for an interview question.
+The candidate has ALREADY spoken this initial interview answer aloud:
+"""
+${directAnswer}
+"""
+
+CRITICAL RULES:
+- DO NOT repeat or duplicate the candidate's spoken answer above.
+- Provide structured technical details that complement the spoken answer:
+  - For comparisons: Include a Markdown comparison table across key technical dimensions, compilable code examples with expected output, and engineering trade-offs.
+  - For definitions & mechanisms: Deep dive into internal working, memory layout/architecture, failure modes, and potential interviewer follow-up questions.
+  - For DSA: Step-by-step logic, compilable implementation, complexity analysis, and edge cases.
+
+Format using clean markdown with clear headings:
+### Level 2: Supporting Technical Explanation
+- Reference Comparison Table (for comparisons)
+- Compilable Code Examples & Expected Output
+- Complexity & Resource Overhead
+
+### Level 3: Additional Technical Depth & Trade-Offs
+- Memory Management & Performance Considerations
+- Real-World Trade-Offs & Edge Cases
+- Likely Interviewer Follow-Up Questions
+
+Interview Question: ${prompt}`;
+}
+
+/**
  * Parses streaming or raw text from Ollama into a structured CopilotAnswer.
  * Preserves the complete layered markdown explanation, extracts 5–15s spoken definition,
  * extracts code snippets, and cleanly detects incomplete responses without fabricating text.
@@ -241,33 +719,54 @@ export function parseStreamingAnswer(
 ): CopilotAnswer {
   const clean = rawText.trim();
   
-  // 1. Try JSON parse if formatted as JSON
-  if (clean.startsWith('{') && clean.endsWith('}')) {
-    try {
-      const parsed = JSON.parse(clean);
-      return {
-        id: 'ans_ollama_' + Math.random().toString(36).substring(2, 8),
-        question,
-        mode,
-        summary: parsed.summary || 'Direct technical solution.',
-        spokenScript: parsed.spokenScript || parsed.script || parsed.summary,
-        bullets: Array.isArray(parsed.bullets) && parsed.bullets.length > 0 
-          ? parsed.bullets.map((b: any) => typeof b === 'string' ? b : String(b.text || Object.values(b)[0]))
-          : [parsed.summary || 'Core technical solution.'],
-        codeSnippet: parsed.codeSnippet && parsed.codeSnippet.code ? {
-          language: parsed.codeSnippet.language || 'typescript',
-          code: parsed.codeSnippet.code,
-          explanation: parsed.codeSnippet.explanation,
-          timeComplexity: parsed.codeSnippet.timeComplexity,
-          spaceComplexity: parsed.codeSnippet.spaceComplexity
-        } : undefined,
-        tradeoffs: Array.isArray(parsed.tradeoffs) ? parsed.tradeoffs : undefined,
-        rawText: clean,
-        isIncomplete: doneReason === 'length',
-        doneReason: doneReason || 'stop',
-        timestamp: Date.now()
-      };
-    } catch {}
+  // 1. Try robust JSON parse only if the response is formatted as a JSON object (or wrapped in ```json ``` fence)
+  if (clean.startsWith('{') || /^```(?:json)?\s*\{/i.test(clean)) {
+    let jsonCandidate = clean;
+    const jsonBlock = clean.match(/^```(?:json)?\s*(\{[\s\S]*?\})\s*```/i);
+    if (jsonBlock && jsonBlock[1]) {
+      jsonCandidate = jsonBlock[1].trim();
+    } else if (!jsonCandidate.startsWith('{')) {
+      const startIdx = jsonCandidate.indexOf('{');
+      const endIdx = jsonCandidate.lastIndexOf('}');
+      if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+        jsonCandidate = jsonCandidate.substring(startIdx, endIdx + 1);
+      }
+    }
+
+    if (jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(jsonCandidate);
+        const rawDirect = parsed.directAnswer || parsed.spokenScript || parsed.script;
+        const rawSummary = parsed.summary;
+        if (rawDirect || rawSummary) {
+          const directAnswer = cleanDirectSpeakableAnswer(rawDirect || rawSummary);
+          const cleanSum = cleanSupportingSummary(rawSummary || 'Direct technical solution.', directAnswer);
+          return {
+            id: 'ans_ollama_' + Math.random().toString(36).substring(2, 8),
+            question,
+            mode,
+            directAnswer,
+            summary: cleanSum,
+            spokenScript: directAnswer,
+            bullets: Array.isArray(parsed.bullets) && parsed.bullets.length > 0 
+              ? parsed.bullets.map((b: any) => typeof b === 'string' ? b : String(b.text || Object.values(b)[0]))
+              : [cleanSum || 'Core technical solution.'],
+            codeSnippet: parsed.codeSnippet && parsed.codeSnippet.code ? {
+              language: parsed.codeSnippet.language || 'typescript',
+              code: parsed.codeSnippet.code,
+              explanation: parsed.codeSnippet.explanation,
+              timeComplexity: parsed.codeSnippet.timeComplexity,
+              spaceComplexity: parsed.codeSnippet.spaceComplexity
+            } : undefined,
+            tradeoffs: Array.isArray(parsed.tradeoffs) ? parsed.tradeoffs : undefined,
+            rawText: clean,
+            isIncomplete: doneReason === 'length',
+            doneReason: doneReason || 'stop',
+            timestamp: Date.now()
+          };
+        }
+      } catch {}
+    }
   }
 
   // 2. Extract code block if present (complete or unclosed)
@@ -291,18 +790,40 @@ export function parseStreamingAnswer(
   // 3. Trade-offs extraction (if present as a distinct section)
   let summaryText = clean;
   const tradeoffs: string[] = [];
-  const tradeoffMatch = clean.match(/(?:^|\n)\*\*(?:Trade-offs|Tradeoffs)\*\*[:\s]*([\s\S]*)$/i);
+  const tradeoffMatch = clean.match(/(?:^|\n)(?:#{2,3}\s*(?:Applications\s*&\s*Trade-Offs|Trade-offs|Tradeoffs|When to Use Which)|\*\*(?:Trade-offs|Tradeoffs)\*\*)[:\s]*([\s\S]*)$/i);
   if (tradeoffMatch) {
-    summaryText = clean.substring(0, tradeoffMatch.index).trim();
     const tradeLines = tradeoffMatch[1].split('\n').map(l => l.trim()).filter(Boolean);
     for (const tl of tradeLines) {
-      tradeoffs.push(tl.replace(/^[-*]\s*|\d+\.\s*/, '').trim());
+      if (tl.startsWith('- ') || tl.startsWith('* ') || /^\d+\.\s*/.test(tl)) {
+        tradeoffs.push(tl.replace(/^[-*]\s*|\d+\.\s*/, '').trim());
+      } else if (tl.length > 5 && !tl.startsWith('#')) {
+        tradeoffs.push(tl.trim());
+      }
     }
   }
 
   // 4. Extract spokenScript (suitable to speak aloud in 5–15 seconds)
   let spokenScript = '';
-  const explicitScriptMatch = clean.match(/(?:^|\n)\*\*(?:Spoken Script|What to say out loud|Interview Script)\*\*[:\s]*([\s\S]*?)(?:\n\n|\n\*\*|$)/i);
+  // Check for ### Interview Answer or **Interview Answer**
+  const explicitInterviewMatch = clean.match(/(?:^|\n)###?\s*(?:\d+\.?\s*)?Interview Answer[:\s]*([\s\S]*?)(?=(?:\n\n###|\n###|\n\n\*\*---|$))/i);
+  if (explicitInterviewMatch && explicitInterviewMatch[1].trim()) {
+    spokenScript = explicitInterviewMatch[1].trim();
+    // Remove the Interview Answer heading and content from summaryText so it is not duplicated
+    summaryText = clean.replace(/(?:^|\n)###?\s*(?:\d+\.?\s*)?Interview Answer[:\s]*[\s\S]*?(?=(?:\n\n###|\n###|\n\n\*\*---|$))/i, '').trim();
+  }
+
+  // Check if text has an explicit Stage 2 section header and unheaded opening answer
+  if (!spokenScript) {
+    const stage2HeaderMatch = clean.match(/(?:^|\n)(?:###?\s*(?:\d+\.?\s*)?(?:Detailed Explanation|Key Differences|Definitions & Core Properties|Definitions|Underlying Mechanism|Definition, Purpose|How It Works|Internal Working|Protocol Flow|Internal Architecture|Algorithm Steps|Execution Mechanics|Step-by-Step Execution Flow|Defensive Implementation|Code Example|Practical Examples|Practical & Code Example|Practical Code Example|When to Use Which|When to Use Each|Applications & Trade-Offs|Applications, Best Practices|Applications, Significance|Hierarchy & Structure|Hierarchy|Types & Classifications|Types, Stages|Types|Core Principles|Root Causes|Prevention Strategies|Prevention|Real-World Examples|Economic Drivers|Photosynthetic Stages|Relational Algebra|Summary Comparison Table)[\s\S]*)/i);
+    if (stage2HeaderMatch && stage2HeaderMatch.index !== undefined && stage2HeaderMatch.index > 0) {
+      const openingText = clean.substring(0, stage2HeaderMatch.index).trim();
+      if (openingText.length > 20) {
+        spokenScript = openingText;
+        summaryText = clean.substring(stage2HeaderMatch.index).trim();
+      }
+    }
+  }
+  const explicitScriptMatch = !spokenScript ? clean.match(/(?:^|\n)\*\*(?:Spoken Script|What to say out loud|Interview Script)\*\*[:\s]*([\s\S]*?)(?:\n\n|\n\*\*|$)/i) : null;
   if (explicitScriptMatch && explicitScriptMatch[1].trim()) {
     spokenScript = explicitScriptMatch[1].trim();
   } else {
@@ -322,14 +843,14 @@ export function parseStreamingAnswer(
         if (conceptDefMatch && conceptDefMatch[1].trim()) {
           spokenScript = conceptDefMatch[1].trim();
         } else {
-          // Fallback: first 1–2 complete sentences of the opening paragraph
+          // Fallback: complete sentences of the opening paragraph
           const firstPara = clean
             .replace(/```[\s\S]*?```/g, '')
             .split(/\n\s*\n/)[0]
             .replace(/^(?:#+\s*|\*\*[^*]+\*\*[:\s]*)+/gm, '')
             .trim();
           const sentences = firstPara.match(/[^.!?]+[.!?]+/g);
-          spokenScript = sentences ? sentences.slice(0, 2).join(' ').trim() : firstPara.slice(0, 200).trim();
+          spokenScript = sentences ? sentences.slice(0, 5).join(' ').trim() : firstPara.trim();
         }
       }
     }
@@ -372,12 +893,16 @@ export function parseStreamingAnswer(
     }
   }
 
+  const directAnswer = cleanDirectSpeakableAnswer(spokenScript || cleanSummary);
+  const cleanSummaryText = cleanSupportingSummary(cleanSummary, directAnswer);
+
   return {
     id: 'ans_ollama_' + Math.random().toString(36).substring(2, 8),
     question,
     mode,
-    summary: cleanSummary,
-    spokenScript,
+    directAnswer,
+    summary: cleanSummaryText || cleanSummary,
+    spokenScript: directAnswer,
     bullets: bullets.length > 0 ? bullets : [],
     codeSnippet,
     tradeoffs: tradeoffs.length > 0 ? tradeoffs : undefined,
@@ -395,12 +920,26 @@ export async function generateOllamaAnswer(
   jobDescription = '',
   modelParam = '',
   urlParam = '',
-  explicitCategory?: QuestionCategory
+  explicitCategory?: QuestionCategory,
+  customSystemPrompt?: string,
+  optionsParam?: {
+    temperature?: number;
+    maxTokens?: number;
+    contextHistory?: Array<{ question: string; summary: string }>;
+    configuredLanguage?: string;
+  }
 ): Promise<CopilotAnswer | null> {
-  const trimmedLower = prompt.trim().toLowerCase();
-  const classification = classifyUtterance(prompt);
+  const contextTurns: ConversationTurnSummary[] = optionsParam?.contextHistory
+    ? optionsParam.contextHistory.map((c, i) => ({
+        id: `turn_${i}`,
+        question: c.question,
+        summary: c.summary,
+        timestamp: Date.now() - (i * 1000)
+      }))
+    : [];
+  const classification = classifyUtterance(prompt, contextTurns);
 
-  // Quick bypass for non-questions (statements, greetings, topic transitions)
+  // Quick bypass for non-questions (statements, greetings, topic transitions, acknowledgements)
   if (!classification.isQuestion) {
     console.log(`[Ollama] Skipping non-question: "${prompt}" (Intent: ${classification.intent}, Reason: ${classification.reason})`);
     return null;
@@ -410,13 +949,16 @@ export async function generateOllamaAnswer(
   const ollamaUrl = baseOllama.endsWith('/api/generate') ? baseOllama : `${baseOllama.replace(/\/$/, '')}/api/generate`;
   const modelName = modelParam || process.env.OLLAMA_MODEL || 'qwen2.5:3b';
 
-  const { systemPrompt, userPrompt } = buildQuestionSpecificPrompt(
-    prompt,
-    mode,
-    explicitCategory || classification.category,
-    resumeContext,
-    jobDescription
-  );
+  const promptPayload = customSystemPrompt
+    ? { systemPrompt: customSystemPrompt, userPrompt: prompt }
+    : buildInterviewAssistantPrompt(prompt, optionsParam?.contextHistory, optionsParam?.configuredLanguage);
+
+  const effectiveSystemPrompt = promptPayload.systemPrompt;
+  const effectiveUserPrompt = promptPayload.userPrompt;
+  const temperature = typeof optionsParam?.temperature === 'number' ? optionsParam.temperature : 0.2;
+  const isTwoSentences = /two sentences|2 sentences|briefly|in 2 sentences/i.test(prompt);
+  const defaultTokens = isTwoSentences ? 250 : 1200;
+  const maxTokens = typeof optionsParam?.maxTokens === 'number' ? optionsParam.maxTokens : defaultTokens;
 
   try {
     const controller = new AbortController();
@@ -427,14 +969,15 @@ export async function generateOllamaAnswer(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: modelName,
-        prompt: `${systemPrompt}\n\nCandidate Question: ${userPrompt}`,
+        system: effectiveSystemPrompt,
+        prompt: effectiveUserPrompt,
         stream: false,
         options: {
           num_gpu: 99,
           num_thread: 8,
           num_ctx: 2048,
-          num_predict: 650,
-          temperature: 0.1
+          num_predict: maxTokens,
+          temperature
         },
         keep_alive: -1 // Keep model permanently hot in GPU/VRAM to eliminate reload delay
       }),
@@ -453,7 +996,15 @@ export async function generateOllamaAnswer(
       return null;
     }
 
-    return parseStreamingAnswer(data.response, prompt, mode, data.done_reason);
+    const rawResponse = data.response;
+    const parsed = parseStreamingAnswer(rawResponse, prompt, mode, data.done_reason);
+    const cleanSpoken = cleanDirectSpeakableAnswer(parsed.directAnswer || parsed.spokenScript || rawResponse);
+    const factualCheck = validateFactualClaims(prompt, cleanSpoken);
+    const finalAnswerText = factualCheck.isFactuallyAccurate ? cleanSpoken : factualCheck.repairedText;
+
+    parsed.directAnswer = finalAnswerText;
+    parsed.spokenScript = finalAnswerText;
+    return parsed;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[Ollama] Local generation unavailable (${msg}). Gracefully falling back to local smart engine.`);
@@ -511,6 +1062,42 @@ export function generateSmartCopilotAnswer(prompt: string, mode: AnswerMode = 'g
         'Pivot: Ready to transition smoothly into the technical questions.'
       ],
       timestamp: now
+    };
+  }
+
+  // -------------------------------------------------------------
+  // 0c. UNIFIED INTENT-AWARE ENGINE DISPATCHER (ZERO CONTAMINATION)
+  // -------------------------------------------------------------
+  const intentResult = classifyQuestionIntent(prompt);
+
+  // A. Structured Comparison Questions (Section 4 Mandatory 6-Part Standard)
+  if (intentResult.intent === 'COMPARISON') {
+    const { conceptA, conceptB, conceptC } = intentResult.extractedConcepts || {};
+    if (isKnownComparison(conceptA || '', conceptB || '', prompt, conceptC)) {
+      return generateStructuredComparison(conceptA || 'Concept A', conceptB || 'Concept B', prompt, conceptC);
+    }
+  }
+
+  // B. Accurate Technical & DSA Explanations (Test A, Test C)
+  const techAns = generateTechnicalAnswer(prompt);
+  if (techAns) {
+    return techAns;
+  }
+
+  // C. Personal & Project Questions (Test D, E, F, G)
+  if (intentResult.intent === 'PERSONAL_CAREER' || intentResult.intent === 'PROJECT_SPECIFIC') {
+    const pAns = generatePersonalizedAnswer(prompt, 'medium', INITIAL_USER_PROFILE, INITIAL_PROJECTS);
+    return {
+      id: pAns.id,
+      question: prompt,
+      mode: mode || 'general',
+      directAnswer: pAns.spokenScript,
+      summary: pAns.structure.directAnswer.startsWith('My project is') || pAns.structure.directAnswer.startsWith('The architecture of') || pAns.structure.directAnswer.startsWith('In ') || pAns.structure.directAnswer.startsWith('To be completely clear')
+        ? `### 1. Architecture & Implementation Breakdown\n${pAns.bullets.map(b => `- ${b}`).join('\n')}`
+        : `### 1. Personal Motivation & Rationale\n${pAns.structure.personalMotivation}\n\n### 2. Supporting Real-World Example\n${pAns.structure.supportingExample}\n\n### 3. Connection to Target Role & Goals\n${pAns.structure.roleOrCareerConnection}`,
+      spokenScript: pAns.spokenScript,
+      bullets: pAns.bullets,
+      timestamp: Date.now()
     };
   }
 
@@ -576,66 +1163,13 @@ public int divide(int a, int b) {
   }
 
   // -------------------------------------------------------------
-  // 0b2. OOP: METHOD OVERRIDING VS METHOD OVERLOADING (Layered Format)
+  // 0b2. OOP: METHOD OVERRIDING VS METHOD OVERLOADING (Structured Comparison)
   // -------------------------------------------------------------
   if (
     (p.includes('overriding') && p.includes('overloading')) ||
     (p.includes('override') && p.includes('overload'))
   ) {
-    return {
-      id,
-      question: prompt,
-      mode: 'coding',
-      summary: `**Method Overriding — Definition**
-
-Method overriding occurs when a subclass provides its own implementation of an inherited instance method, using a compatible signature and return type, subject to Java's overriding rules.
-
-**Method Overloading — Definition**
-
-Method overloading means defining methods with the same name but different parameter lists, usually in the same class.
-
-**Key Differences**
-- **Purpose:** Overriding specializes inherited behavior; overloading provides different ways to perform an operation.
-- **Parameters:** Overriding uses a compatible method signature; overloading requires different parameter lists.
-- **Polymorphism:** Overriding supports runtime polymorphism; overloading is commonly associated with compile-time polymorphism.
-
-**Example**
-\`\`\`java
-class Calculator {
-    int add(int a, int b) { return a + b; }
-    int add(int a, int b, int c) { return a + b + c; }
-}
-
-class Animal {
-    void sound() { System.out.println("Animal sound"); }
-}
-class Dog extends Animal {
-    @Override
-    void sound() { System.out.println("Bark"); }
-}
-\`\`\`
-
-**Interview Summary**
-Overriding changes inherited method behavior, while overloading defines multiple versions of a method with different parameters.`,
-      spokenScript: 'Overriding changes inherited method behavior, while overloading defines multiple versions of a method with different parameters.',
-      bullets: [],
-      codeSnippet: {
-        language: 'java',
-        code: `class Calculator {
-    int add(int a, int b) { return a + b; }
-    int add(int a, int b, int c) { return a + b + c; }
-}
-
-class Animal {
-    void sound() { System.out.println("Animal sound"); }
-}
-class Dog extends Animal {
-    @Override
-    void sound() { System.out.println("Bark"); }
-}`
-      },
-      timestamp: now
-    };
+    return generateStructuredComparison('Method Overloading', 'Method Overriding', prompt);
   }
 
   // -------------------------------------------------------------
@@ -1214,50 +1748,7 @@ SELECT * FROM users WHERE email = ? AND password_hash = ?;`
   // 1A. JAVA: METHOD OVERLOADING VS METHOD OVERRIDING (DIFFERENCE)
   // -------------------------------------------------------------
   if (p.includes('overload') && p.includes('overrid')) {
-    return {
-      id,
-      question: prompt,
-      mode: 'coding',
-      summary: 'The main difference is that method overloading is compile-time (static) polymorphism within the same class where methods share the same name with different parameter signatures, while method overriding is runtime (dynamic) polymorphism where a subclass redefines an inherited method using the exact same signature.',
-      spokenScript: 'The main difference comes down to compile-time versus runtime polymorphism. In method overloading, multiple methods in the same class share the same name but have different parameter types or counts, resolved statically at compile time by the compiler. In method overriding, a subclass provides a specific implementation of a method already declared in its superclass using the exact same signature, resolved dynamically at runtime via the virtual method table (vtable). A common trap is trying to overload just by changing the return type, which Java rejects, whereas overriding requires identical or covariant return types.',
-      bullets: [
-        'Polymorphism Type: Method overloading is static (compile-time) polymorphism; method overriding is dynamic (runtime) polymorphism resolved by the JVM invokevirtual instruction.',
-        'Scope & Inheritance: Overloading occurs within the same class (or across hierarchy); Overriding strictly requires an inheritance relationship between a superclass and a subclass.',
-        'Method Signatures: Overloaded methods MUST have different parameter lists (count, types, or order); Overridden methods MUST have identical method names, parameter lists, and covariant return types.',
-        'Access & Exceptions: Overriding cannot reduce access visibility (e.g. public cannot become protected) and cannot declare broader checked exceptions; Overloading has no such restrictions.',
-        'Private / Static / Final: Private, static, and final methods can be overloaded, but cannot be overridden because they are resolved with static binding.'
-      ],
-      codeSnippet: {
-        language: 'java',
-        code: `// 1. Method Overloading (Compile-Time Polymorphism in same class)
-class Calculator {
-    int add(int a, int b) { return a + b; }
-    double add(double a, double b) { return a + b; }
-}
-
-// 2. Method Overriding (Runtime Polymorphism across inheritance hierarchy)
-class Animal {
-    void makeSound() { System.out.println("Generic sound"); }
-}
-
-class Dog extends Animal {
-    @Override
-    void makeSound() { System.out.println("Woof! (Overridden at runtime)"); }
-}
-
-// Runtime dynamic dispatch via vtable:
-Animal pet = new Dog();
-pet.makeSound(); // Prints "Woof!" based on heap object type`
-      },
-      complexity: {
-        time: 'Overloading: O(1) static compiler resolution; Overriding: O(1) vtable pointer dereference',
-        space: 'O(1) auxiliary space'
-      },
-      tradeoffs: [
-        'Overloading enhances API readability without runtime cost; Overriding enables flexible open-closed polymorphism but requires virtual method dispatch overhead.'
-      ],
-      timestamp: now
-    };
+    return generateStructuredComparison('Method Overloading', 'Method Overriding', prompt);
   }
 
   // -------------------------------------------------------------
@@ -2238,20 +2729,78 @@ CMD ["npm", "start"]`
   }
 
   // -------------------------------------------------------------
-  // 16. GIT & VERSION CONTROL (REBASE VS MERGE)
+  // 16. GIT & VERSION CONTROL (ACCURATE DISAMBIGUATION)
   // -------------------------------------------------------------
-  if (p.includes('git') || p.includes('rebase') || p.includes('merge')) {
+  // 16a. Git Merge vs Git Rebase
+  if (
+    (p.includes('rebase') && p.includes('merge')) ||
+    p.includes('git rebase') ||
+    p.includes('rebase vs merge') ||
+    p.includes('merge vs rebase')
+  ) {
     return {
       id,
       question: prompt,
       mode: 'general',
-      summary: 'Git is a distributed version control system. git merge combines branch histories by creating a new merge commit; git rebase rewrites branch history linearly onto the tip of the target branch.',
+      summary: 'git merge combines branch histories by creating an explicit merge commit, preserving historical chronology; git rebase rewrites history linearly by replaying commits onto the target branch tip.',
       spokenScript: 'The choice between git merge and git rebase is about commit history cleanliness versus complete historical accuracy. git merge is non-destructive: it takes two branches and combines them with a new 3-way merge commit, preserving the exact chronological sequence of when commits happened. git rebase, on the other hand, rewrites history by moving the base of your feature branch to the latest commit of main, giving you a clean, linear commit history without cluttering merge commits. The golden rule is: never rebase public shared branches.',
       bullets: [
         'git merge: Preserves true historical context and branch topology. Creates an explicit merge commit with multiple parent commits.',
         'git rebase: Replays your commits one by one onto the new base commit, creating a linear history. Ideal for cleaning up local feature branches before opening a PR.',
         'Golden Rule of Rebase: Never rebase commits that have already been pushed to a public/shared branch, as it changes commit hashes and forces upstream team members to resolve merge conflicts.',
         'Squash and Merge: Combines all feature commits into a single clean commit on main, giving the best of both worlds.'
+      ],
+      timestamp: now
+    };
+  }
+
+  // 16b. Pull Request vs git pull / pull command
+  if (
+    ((p.includes('pull request') || p.includes('pr')) && (p.includes('git pull') || p.includes('pull command') || p.includes('pull in github')))
+  ) {
+    return generateStructuredComparison('GitHub Pull Request', 'git pull', prompt);
+  }
+
+  // 16c. git fetch vs git pull
+  if (
+    p.includes('fetch') && (p.includes('git pull') || p.includes('pull command') || (p.includes('pull') && !p.includes('request')))
+  ) {
+    return generateStructuredComparison('git fetch', 'git pull', prompt);
+  }
+
+  // 16d. git merge vs git pull
+  if (
+    p.includes('merge') && (p.includes('git pull') || p.includes('pull command') || (p.includes('pull') && !p.includes('request')))
+  ) {
+    return generateStructuredComparison('git merge', 'git pull', prompt);
+  }
+
+  // 16e. git fetch vs GitHub Pull Request
+  if (
+    p.includes('fetch') && (p.includes('pull request') || p.includes('pr'))
+  ) {
+    return generateStructuredComparison('git fetch', 'GitHub Pull Request', prompt);
+  }
+
+  // 16f. Relationship & single concept queries via technical engine
+  const gitRelAns = generateTechnicalAnswer(prompt);
+  if (gitRelAns && (p.includes('pull request') || p.includes('git pull') || p.includes('git fetch') || p.includes('git merge'))) {
+    return gitRelAns;
+  }
+
+  // 16g. General Git / Version Control Overview
+  if (p.includes('git') || p.includes('version control') || p.includes('vcs')) {
+    return {
+      id,
+      question: prompt,
+      mode: 'general',
+      summary: 'Git is a distributed version control system (DVCS) that tracks changes in source code across branches, enabling distributed team collaboration, local staging, atomic commits, and seamless history management.',
+      spokenScript: 'Git is a distributed version control system where every developer has a complete clone of the entire repository history locally. Its core workflow revolves around three trees: the working directory, the staging area (index), and the commit history. It enables fast local branching and merging, cryptographic integrity through SHA-1/SHA-256 hashes, and distributed collaboration through remote tracking branches.',
+      bullets: [
+        'Distributed Architecture: Every local repository has full repository history, allowing full offline operation (committing, branching, diffing).',
+        'Three Trees Model: Working Tree (local uncommitted files) -> Staging Area (prepared snapshot via git add) -> Git Directory (committed immutable history).',
+        'Branching & Merging: Lightweight pointer references to commit hashes making branch creation and switching instantaneous (O(1)).',
+        'Data Integrity: Uses cryptographic hashes to ensure commit snapshots cannot be tampered with undetected.'
       ],
       timestamp: now
     };
@@ -2349,8 +2898,8 @@ COMMIT;`
     };
   }
 
-  // Dedicated Array vs ArrayList concept handler
-  if (p.includes('array') && (p.includes('arraylist') || p.includes('array list') || p.includes('difference between array') || p.includes('vs'))) {
+  // Dedicated Array vs ArrayList concept handler (Strict Difference Match)
+  if (p.includes('difference between') && p.includes('array') && (p.includes('arraylist') || p.includes('array list'))) {
     return {
       id,
       question: prompt,

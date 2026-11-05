@@ -29,7 +29,7 @@ function analyzeWavBuffer(buf: Buffer) {
     }
     const rms = numSamples > 0 ? Math.sqrt(sumSquares / numSamples) : 0;
     // Real audible speech typically has a peak >= 0.015 and rms >= 0.001
-    const isAudible = maxPeak >= 0.015 && rms >= 0.001;
+    const isAudible = maxPeak >= 0.008 && rms >= 0.0005;
 
     return {
       valid: true,
@@ -275,7 +275,21 @@ export async function POST(req: NextRequest) {
             await fs.promises.appendFile(path.join(os.tmpdir(), 'transcribe_debug.log'), resultLog);
           } catch {}
 
-          const normResult = normalizeTechnicalTerms(transcript);
+          let normResult: import('@/lib/technicalTermNormalizer').TermNormalizationResult;
+          try {
+            normResult = normalizeTechnicalTerms(transcript);
+          } catch (normErr) {
+            console.warn('[Transcribe API] normalizeTechnicalTerms error, falling back to raw:', normErr);
+            normResult = {
+              originalText: transcript,
+              normalizedText: transcript,
+              corrections: [],
+              detectedDomains: [],
+              hasUnknownSuspectTerm: false,
+              suspectTerms: [],
+              latencyMs: 0
+            };
+          }
 
           return NextResponse.json({
             transcript: normResult.normalizedText,

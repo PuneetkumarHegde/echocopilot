@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "npx tsx scripts/test-unified-intelligence.mjs && npx tsx scripts/test-career-assistant.mjs && npx tsx scripts/test-core-cs-suite.mjs && npx tsx scripts/test-git-pipeline-disambiguation.mjs && npx tsx scripts/test-progressive-depth.mjs && npx tsx scripts/test-regexes-normalizer-regression.mjs && npx tsx scripts/test-answer-detail-expansion.mjs && npx tsx scripts/test-long-speech-question-recognition.mjs && npx tsx scripts/test-concept-complete-answers.mjs",
     "electron": "electron electron/main.js",
     "desktop": "electron electron/main.js",
     "localhost": "next dev"

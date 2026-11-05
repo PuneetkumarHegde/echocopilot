@@ -3,6 +3,8 @@
 import React, { useState, useEffect } from 'react';
 import { Header } from '@/components/Header';
 import { CopilotModule } from '@/components/CopilotModule';
+import { ProfileModule } from '@/components/ProfileModule';
+import { ProjectVaultModule } from '@/components/ProjectVaultModule';
 import { MockInterviewModule } from '@/components/MockInterviewModule';
 import { ResumeAnalyzerModule } from '@/components/ResumeAnalyzerModule';
 import { QuestionBankModule } from '@/components/QuestionBankModule';
@@ -57,6 +59,10 @@ export default function Home() {
           />
         )}
 
+        {activeModule === 'profile' && <ProfileModule />}
+
+        {activeModule === 'projects' && <ProjectVaultModule />}
+
         {activeModule === 'mock' && <MockInterviewModule />}
 
         {activeModule === 'resume' && <ResumeAnalyzerModule />}
@@ -77,15 +83,15 @@ export default function Home() {
           <div className="flex items-center gap-2">
             <span className="font-semibold text-zinc-400">EchoCopilot</span>
             <span>•</span>
-            <span>Practical ParakeetAI-Inspired Real-Time Interview Assistant</span>
+            <span>Personalized AI Career & Real-Time Interview Copilot</span>
           </div>
 
           <div className="flex items-center gap-4 text-[11px]">
             <span className="flex items-center gap-1 text-emerald-500/80">
               <ShieldCheck className="w-3.5 h-3.5" />
-              Client-Side IndexedDB Storage
+              Client-Side IndexedDB Storage v2
             </span>
-            <span>Zero-Config Fallback Engine Ready</span>
+            <span>Secret Shield Protected</span>
           </div>
         </div>
       </footer>

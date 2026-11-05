@@ -20,7 +20,12 @@ const SAFE_TECH_REPLACEMENTS: [RegExp, string][] = [
   [/\bgraphql\b|\bgraph\s*q\s*l\b/gi, 'GraphQL'],
   [/\brabbit\s*m\s*q\b|\brabbitmq\b/gi, 'RabbitMQ'],
   [/\bg\s*r\s*p\s*c\b|\bgrpc\b/gi, 'gRPC'],
-  [/\boauth\s*2\b|\bo\s*auth\b/gi, 'OAuth 2.0']
+  [/\boauth\s*2\b|\bo\s*auth\b/gi, 'OAuth 2.0'],
+  [/\b(j\s*v\s*m)\b/gi, 'JVM'],
+  [/\b(rest\s*api|restful\s*api)\b/gi, 'REST API'],
+  [/\b(array\s*list|arraylist)\b/gi, 'ArrayList'],
+  [/\b(linked\s*list|linkedlist)\b/gi, 'LinkedList'],
+  [/\b(hash\s*map|hashmap)\b/gi, 'HashMap']
 ];
 
 import { normalizeTechnicalTerms, TermNormalizationResult } from './technicalTermNormalizer';
@@ -29,21 +34,27 @@ export function normalizeTechnicalSpeech(rawText: string, contextTopics?: string
   if (!rawText || typeof rawText !== 'string') return '';
   let cleaned = rawText.trim();
 
-  // 1. Apply unambiguous literal acronyms/syntax
-  for (const [regex, replacement] of SAFE_TECH_REPLACEMENTS) {
-    cleaned = cleaned.replace(regex, replacement);
-  }
+  try {
+    // 1. Apply unambiguous literal acronyms/syntax
+    for (const [regex, replacement] of SAFE_TECH_REPLACEMENTS) {
+      cleaned = cleaned.replace(regex, replacement);
+    }
 
-  // 2. Apply local technical-term guess engine
-  const normResult = normalizeTechnicalTerms(cleaned, contextTopics);
-  cleaned = normResult.normalizedText;
+    // 2. Apply local technical-term guess engine
+    const normResult = normalizeTechnicalTerms(cleaned, contextTopics);
+    if (normResult && typeof normResult.normalizedText === 'string') {
+      cleaned = normResult.normalizedText;
+    }
 
-  // Normalize extra whitespace
-  cleaned = cleaned.replace(/\s{2,}/g, ' ');
+    // Normalize extra whitespace
+    cleaned = cleaned.replace(/\s{2,}/g, ' ');
 
-  // Capitalize first character
-  if (cleaned.length > 0) {
-    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+    // Capitalize first character
+    if (cleaned.length > 0) {
+      cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+    }
+  } catch (err) {
+    console.warn('[speechNormalizer] Error during speech normalization, returning safe fallback:', err);
   }
 
   return cleaned;

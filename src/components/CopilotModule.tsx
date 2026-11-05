@@ -7,7 +7,8 @@ import {
   AudioSourceMode, AnswerTriggerPolicy, AudioPipelineStatus,
   AudioInputDevice
 } from '@/lib/types';
-import { saveSession } from '@/lib/storage';
+import { saveSession, getUserProfile, getAllProjects, getActiveContext } from '@/lib/storage';
+import { UserProfile, ProjectRecord } from '@/lib/profileTypes';
 import { 
   isMeaningfulQuestion, QuestionDeduplicator, shouldTriggerAnswer, 
   isAutoAnswerAllowedForMode, formatAudioErrorMessage,
@@ -27,7 +28,9 @@ import {
 } from '@/lib/questionClassifier';
 import { normalizeTechnicalSpeech } from '@/lib/speechNormalizer';
 import { normalizeTechnicalTerms, TermNormalizationResult } from '@/lib/technicalTermNormalizer';
+import { FormattedMarkdown } from '@/components/FormattedMarkdown';
 import { startPcmStreamRecorder, PcmStreamRecorder } from '@/lib/wavRecorder';
+import { recordPipelineDiagnostic } from '@/lib/audioPipelineHelper';
 import { parseStreamingAnswer } from '@/lib/aiFallback';
 import { FloatingCopilotOverlay } from './FloatingCopilotOverlay';
 import { 
@@ -116,6 +119,24 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [setupNotice, setSetupNotice] = useState<string | null>(null);
   const [sttStatusNotice, setSttStatusNotice] = useState<string | null>(null);
+  const [careerProfile, setCareerProfile] = useState<UserProfile | null>(null);
+  const [activeProjects, setActiveProjects] = useState<ProjectRecord[]>([]);
+
+  useEffect(() => {
+    async function loadCareerContext() {
+      try {
+        const p = await getUserProfile();
+        setCareerProfile(p);
+        const prs = await getAllProjects();
+        const ctx = await getActiveContext();
+        const selected = prs.filter(pr => (ctx.selectedProjectIds || []).includes(pr.id));
+        setActiveProjects(selected.length > 0 ? selected : prs);
+      } catch (e) {
+        console.warn('Failed to load career context into CopilotModule:', e);
+      }
+    }
+    loadCareerContext();
+  }, []);
   const [speechLang, setSpeechLang] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('echocopilot_speech_lang');
@@ -271,6 +292,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         setStreamingAnswerText('');
         setFirstTokenLatency(null);
         setPipelineStatus('idle');
+      } else if (data.type === 'FORCE_FINISH_QUESTION') {
+        handleForceFinishQuestion();
       }
     };
     return () => {
@@ -561,7 +584,12 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           if (item.isFinal) {
             const finalSpeech = item[0].transcript.trim();
             if (finalSpeech && finalSpeech.length >= 2) {
-              const cleanFinal = normalizeTechnicalSpeech(finalSpeech);
+              let cleanFinal = finalSpeech;
+              try {
+                cleanFinal = normalizeTechnicalSpeech(finalSpeech);
+              } catch (normErr) {
+                console.warn('[CopilotModule] normalizeTechnicalSpeech error on final, using raw:', normErr);
+              }
               // Immediately commit finalized turn with zero pause delay!
               commitTurnAndAnswer(cleanFinal, 'mic', activeSpeakerRef.current || 'interviewer');
               setInterimTranscript('');
@@ -584,7 +612,12 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
 
         const cleanInterim = interim.trim();
         if (cleanInterim) {
-          const liveInterim = normalizeTechnicalSpeech(cleanInterim);
+          let liveInterim = cleanInterim;
+          try {
+            liveInterim = normalizeTechnicalSpeech(cleanInterim);
+          } catch {
+            // Keep cleanInterim as fallback
+          }
           setInterimTranscript(liveInterim);
           lastInterimRef.current = liveInterim;
 
@@ -621,7 +654,10 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       rec.onend = () => {
         // If there was uncommitted interim speech when the cycle ended, finalize it cleanly
         if (lastInterimRef.current && lastInterimRef.current.trim().length >= 3) {
-          const leftover = normalizeTechnicalSpeech(lastInterimRef.current.trim());
+          let leftover = lastInterimRef.current.trim();
+          try {
+            leftover = normalizeTechnicalSpeech(leftover);
+          } catch {}
           lastInterimRef.current = '';
           setInterimTranscript('');
           commitTurnAndAnswer(leftover, 'mic', activeSpeakerRef.current || 'interviewer');
@@ -663,20 +699,35 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     micPcmRecorderRef.current = startPcmStreamRecorder({
       stream: micStream,
       source: 'mic',
+      silenceThresholdMs: 700,
+      preRollMs: 350,
+      minUtteranceDurationSec: 0.35,
       onAudioLevel: (level) => {
         setMicAudioLevel(level);
         if (level > 2) setIsMicReceivingAudio(true);
       },
-      onAudioChunk: async (blob, source) => {
-        console.log(`[CopilotModule] Microphone PCM speech chunk ready (${blob.size} bytes) -> sending to /api/transcribe`);
-        setInterimTranscript('🎙️ Transcribing speech...');
-        await sendAudioChunkToTranscribe(blob, source);
+      onSpeechStateChange: (state) => {
+        if (state === 'speaking') {
+          setPipelineStatus('speech_detected');
+        } else if (state === 'flushing') {
+          setPipelineStatus('transcribing');
+        } else if (state === 'idle') {
+          setPipelineStatus('listening');
+        }
       },
-      onError: (err) => console.warn('[CopilotModule] Mic PCM recorder error:', err)
+      onAudioChunk: async (blob, source, utteranceId) => {
+        console.log(`[CopilotModule] Microphone PCM speech chunk ready (${blob.size} bytes, ${utteranceId}) -> sending to /api/transcribe`);
+        setInterimTranscript('🎙️ Transcribing speech...');
+        await sendAudioChunkToTranscribe(blob, source, utteranceId);
+      },
+      onError: (err) => {
+        console.warn('[CopilotModule] Mic PCM recorder error:', err);
+        setPipelineStatus('error');
+      }
     });
   };
 
-  const sendAudioChunkToTranscribe = async (audioBlob: Blob, source: 'mic' | 'meeting') => {
+  const sendAudioChunkToTranscribe = async (audioBlob: Blob, source: 'mic' | 'meeting', utteranceId?: string) => {
     if (isPausedRef.current) return;
 
     try {
@@ -717,7 +768,12 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       });
 
       if (data && data.transcript) {
-        const clean = normalizeTechnicalSpeech(data.transcript.trim());
+        let clean = data.transcript.trim();
+        try {
+          clean = normalizeTechnicalSpeech(clean);
+        } catch (normErr) {
+          console.warn('[CopilotModule] normalizeTechnicalSpeech error on chunk, using raw transcript:', normErr);
+        }
         if (clean.length >= 2) {
           console.log(`[CopilotModule] Delivering transcript to UI turn: "${clean}" (source: ${source})`);
           const speaker = source === 'meeting' ? 'interviewer' : (audioSourceModeRef.current === 'mic_only' ? 'interviewer' : 'candidate');
@@ -750,6 +806,10 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     } catch (err) {
       console.warn('[CopilotModule] sendAudioChunkToTranscribe error:', err);
       setErrorMessage('Audio transcription error: ' + (err instanceof Error ? err.message : String(err)));
+      // Auto-clear transient transcription error so subsequent valid speech and listening continue cleanly
+      setTimeout(() => {
+        setErrorMessage(prev => (prev && prev.startsWith('Audio transcription error:')) ? null : prev);
+      }, 5000);
       setInterimTranscript('');
     } finally {
       if (isSessionActiveRef.current && !isPausedRef.current) {
@@ -870,15 +930,30 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       tabPcmRecorderRef.current = startPcmStreamRecorder({
         stream,
         source: 'meeting',
+        silenceThresholdMs: 700,
+        preRollMs: 350,
+        minUtteranceDurationSec: 0.35,
         onAudioLevel: (level) => {
           setTabAudioLevel(level);
           if (level > 2) setIsTabReceivingAudio(true);
         },
-        onAudioChunk: async (blob, source) => {
-          console.log(`[CopilotModule] Meeting Tab PCM speech chunk (${blob.size} bytes) -> transcribing`);
-          await sendAudioChunkToTranscribe(blob, source);
+        onSpeechStateChange: (state) => {
+          if (state === 'speaking') {
+            setPipelineStatus('speech_detected');
+          } else if (state === 'flushing') {
+            setPipelineStatus('transcribing');
+          } else if (state === 'idle') {
+            setPipelineStatus('listening');
+          }
         },
-        onError: (err) => console.warn('[CopilotModule] Tab PCM recorder error:', err)
+        onAudioChunk: async (blob, source, utteranceId) => {
+          console.log(`[CopilotModule] Meeting Tab PCM speech chunk (${blob.size} bytes, ${utteranceId}) -> transcribing`);
+          await sendAudioChunkToTranscribe(blob, source, utteranceId);
+        },
+        onError: (err) => {
+          console.warn('[CopilotModule] Tab PCM recorder error:', err);
+          setPipelineStatus('error');
+        }
       });
 
       // Listen for user stopping share via native browser notification bar
@@ -1009,7 +1084,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
 
     if (!baseSpeech && source !== 'manual' && transcriptRef.current.length > 0) {
       const last = transcriptRef.current[transcriptRef.current.length - 1];
-      if (last && last.speaker === speaker && (Date.now() - last.timestamp) < 15000) {
+      if (last && last.speaker === speaker && (Date.now() - last.timestamp) < 20000) {
         // Can extend if last turn did not trigger an answer, or was not a complete ready question
         const lastReadiness = isQuestionReadyForAnswer(last.text);
         if (!last.triggeredAnswer || !lastReadiness.isReady) {
@@ -1027,7 +1102,8 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
             lowerTrimmed.startsWith('versus') ||
             lowerTrimmed.startsWith('for') ||
             (/\b(difference|differences|differ|distinguish)\b/i.test(last.text) && hasValidComparisonSubjects(`between ${trimmed}`)) ||
-            candidateReady
+            candidateReady ||
+            !last.triggeredAnswer
           );
 
           if (isContinuation) {
@@ -1347,11 +1423,25 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       let apiKey = '';
       let model = 'qwen2.5:3b';
       let ollamaUrl = 'http://localhost:11434';
+      let temperature = 0.2;
+      let maxTokens = 280;
+      let interviewLanguage = 'Java';
       if (typeof window !== 'undefined') {
         provider = localStorage.getItem('echocopilot_ai_provider') || 'ollama';
         apiKey = localStorage.getItem('echocopilot_api_key') || '';
         model = localStorage.getItem('echocopilot_ai_model') || 'qwen2.5:3b';
         ollamaUrl = localStorage.getItem('echocopilot_ollama_url') || 'http://localhost:11434';
+        const savedTemp = localStorage.getItem('echocopilot_temperature');
+        if (savedTemp !== null) {
+          const parsed = parseFloat(savedTemp);
+          if (!isNaN(parsed)) temperature = parsed;
+        }
+        const savedTokens = localStorage.getItem('echocopilot_max_tokens');
+        if (savedTokens !== null) {
+          const parsed = parseInt(savedTokens, 10);
+          if (!isNaN(parsed)) maxTokens = parsed;
+        }
+        interviewLanguage = localStorage.getItem('echocopilot_interview_language') || 'Java';
       }
 
       console.log(`[CopilotModule] Calling /api/copilot for: "${rawQuery}" (Req #${currentRequestId}, Category: ${finalCategory}, Follow-up: ${isFollowUp})`);
@@ -1368,7 +1458,12 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           ollamaUrl,
           stream: true,
           category: finalCategory,
-          contextHistory: history.map(h => ({ question: h.question, summary: h.summary }))
+          contextHistory: history.map(h => ({ question: h.question, summary: h.summary })),
+          profileContext: careerProfile,
+          projectContext: activeProjects,
+          temperature,
+          maxTokens,
+          interviewLanguage
         }),
         signal: abortController.signal
       });
@@ -1432,7 +1527,26 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
                     }
                   } catch {}
                 }
-              } else if (eventType === 'chunk') {
+              } else if (eventType === 'stage1_chunk') {
+                accumulatedText += data.text || '';
+                if (activeRequestIdRef.current === currentRequestId) {
+                  setStreamingAnswerText(accumulatedText);
+                  try {
+                    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+                      const bc = new BroadcastChannel('echocopilot_channel');
+                      bc.postMessage({ type: 'STREAM_CHUNK', requestId: currentRequestId, text: data.text, accumulated: accumulatedText });
+                      bc.close();
+                    }
+                  } catch {}
+                }
+              } else if (eventType === 'stage1_done') {
+                if (data.directAnswer) {
+                  accumulatedText = data.directAnswer + '\n\n---\n\n';
+                  if (activeRequestIdRef.current === currentRequestId) {
+                    setStreamingAnswerText(accumulatedText);
+                  }
+                }
+              } else if (eventType === 'stage2_chunk' || eventType === 'chunk') {
                 accumulatedText += data.text || '';
                 if (activeRequestIdRef.current === currentRequestId) {
                   setStreamingAnswerText(accumulatedText);
@@ -1559,6 +1673,48 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
   // -------------------------------------------------------------
   // 10. Session Lifecycle Controls (Start, Pause, Resume, Stop)
   // -------------------------------------------------------------
+  
+  const handleForceFinishQuestion = () => {
+    console.log('[CopilotModule] User triggered manual "Finish question / Generate now"');
+    recordPipelineDiagnostic('speech_detection', 'info', 'User triggered manual Finish question / Generate now');
+    if (micPcmRecorderRef.current) {
+      micPcmRecorderRef.current.forceFlush();
+    }
+    if (tabPcmRecorderRef.current) {
+      tabPcmRecorderRef.current.forceFlush();
+    }
+    if (speechFragmentTimerRef.current) {
+      clearTimeout(speechFragmentTimerRef.current);
+      speechFragmentTimerRef.current = null;
+    }
+    setSttStatusNotice(null);
+
+    // 1. If there is pending speech buffered, finalize and trigger immediately
+    if (pendingSpeechBufferRef.current) {
+      const text = pendingSpeechBufferRef.current;
+      const raw = pendingRawBufferRef.current || text;
+      pendingSpeechBufferRef.current = '';
+      pendingRawBufferRef.current = '';
+      finalizeUtteranceAndAnswer(text, raw, 'manual', 'interviewer', null, undefined, undefined, true);
+      return;
+    }
+
+    // 2. If user typed manual input, trigger answer for manual input
+    if (manualInput.trim()) {
+      handleGenerateAnswer(manualInput.trim());
+      return;
+    }
+
+    // 3. If transcript has a recent turn from interviewer that did not trigger an answer, trigger it now
+    if (transcriptRef.current.length > 0) {
+      const last = transcriptRef.current[transcriptRef.current.length - 1];
+      if (last && !last.triggeredAnswer) {
+        last.triggeredAnswer = true;
+        handleGenerateAnswer(last.text);
+      }
+    }
+  };
+
   const handleToggleSession = async () => {
     if (isSessionActive) {
       // STOP SESSION
@@ -1573,6 +1729,12 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       setSessionDuration(0);
       setErrorMessage(null);
       setPipelineStatus('listening');
+      // Fire background model warmup to GPU VRAM
+      fetch('/api/copilot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ warmup: true, model: localStorage.getItem('echocopilot_ai_model') || 'qwen2.5:3b' })
+      }).catch(() => {});
 
       // Keep Ollama hot on GPU
       try {
@@ -1835,6 +1997,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           isTabReceivingAudio={isTabReceivingAudio}
           errorMessage={errorMessage}
           onDismissError={() => setErrorMessage(null)}
+          onForceFinishQuestion={handleForceFinishQuestion}
         />
       </div>
     );
@@ -2355,13 +2518,22 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
                   <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
                   <span className="font-medium">{sttStatusNotice}</span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setSttStatusNotice(null)}
-                  className="text-cyan-400 hover:text-white p-0.5 text-xs"
-                >
-                  ✕
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleForceFinishQuestion}
+                    className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 font-semibold text-[11px] cursor-pointer"
+                  >
+                    Generate Now
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSttStatusNotice(null)}
+                    className="text-cyan-400 hover:text-white p-0.5 text-xs"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
             )}
             <div ref={transcriptBottomRef} />
@@ -2384,6 +2556,17 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
             >
               Ask
             </button>
+            {isSessionActive && (
+              <button
+                type="button"
+                onClick={handleForceFinishQuestion}
+                disabled={isLoadingAnswer}
+                className="px-3 py-2 rounded-xl bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 disabled:opacity-50 font-semibold text-xs whitespace-nowrap cursor-pointer"
+                title="Finish question & generate answer immediately without waiting for silence"
+              >
+                Finish & Answer
+              </button>
+            )}
           </div>
         </div>
 
@@ -2434,18 +2617,16 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
                     🎙️ {ans.question}
                   </h4>
 
-                  {/* Summary */}
-                  <div className="text-xs text-emerald-200 font-medium leading-relaxed bg-emerald-950/20 p-2.5 rounded-lg border border-emerald-800/30">
-                    💡 {ans.summary}
-                  </div>
-
-                  {/* Humanized Spoken Script */}
-                  {ans.spokenScript && (
-                    <div className="p-3 rounded-xl bg-gradient-to-br from-violet-950/40 via-zinc-900 to-indigo-950/30 border border-violet-500/40 space-y-1.5">
-                      <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-violet-300">
-                        <span>How to Say it Out Loud (Interview Script)</span>
+                  {/* 1. Immediate Direct Speakable Answer (Immediate Priority) */}
+                  {(ans.directAnswer || ans.spokenScript) && (
+                    <div className="p-3.5 rounded-xl bg-gradient-to-br from-cyan-950/50 via-zinc-900 to-indigo-950/40 border border-cyan-500/40 shadow-sm space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                        <span className="flex items-center gap-1.5">
+                          <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+                          <span>Direct Speakable Answer</span>
+                        </span>
                         <button
-                          onClick={() => handleCopy('script_' + ans.id, ans.spokenScript!)}
+                          onClick={() => handleCopy('script_' + ans.id, ans.directAnswer || ans.spokenScript!)}
                           className="text-zinc-400 hover:text-zinc-200 flex items-center gap-1"
                         >
                           {copiedCodeId === 'script_' + ans.id ? (
@@ -2461,9 +2642,16 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
                           )}
                         </button>
                       </div>
-                      <p className="text-xs text-zinc-200 leading-relaxed italic bg-zinc-950/70 p-2 rounded border border-violet-500/20">
-                        &ldquo;{ans.spokenScript}&rdquo;
-                      </p>
+                      <div className="text-xs text-cyan-100 leading-relaxed font-medium bg-zinc-950/70 p-2.5 rounded-lg border border-cyan-500/20">
+                        <FormattedMarkdown content={ans.directAnswer || ans.spokenScript || ''} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 2. Supporting Technical Depth (Summary) */}
+                  {ans.summary && (
+                    <div className="text-xs text-zinc-300 leading-relaxed bg-zinc-900/40 p-3 rounded-lg border border-zinc-800">
+                      <FormattedMarkdown content={ans.summary} />
                     </div>
                   )}
 
@@ -2600,6 +2788,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         isTabReceivingAudio={isTabReceivingAudio}
         errorMessage={errorMessage}
         onDismissError={() => setErrorMessage(null)}
+        onForceFinishQuestion={handleForceFinishQuestion}
       />
     </div>
   );

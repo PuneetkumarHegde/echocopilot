@@ -41,16 +41,99 @@ interface TechnicalTermDefinition {
   phoneticCodes?: [string, string];
 }
 
+export type GitCanonicalConcept = 
+  | 'GITHUB_PULL_REQUEST'
+  | 'GIT_PULL'
+  | 'GIT_FETCH'
+  | 'GIT_MERGE'
+  | 'GIT_REBASE';
+
+/**
+ * Disambiguates Git and GitHub technical concepts to prevent collisions between
+ * web collaboration workflows (Pull Request) and local CLI commands (git pull, git fetch, git merge).
+ */
+export function resolveGitCanonicalConcept(raw: string): GitCanonicalConcept | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const s = raw.toLowerCase().trim();
+
+  // 1. Pull Request / PR (Web platform collaboration and code review workflow)
+  // Must be evaluated BEFORE checking single "pull" keyword!
+  if (
+    s === 'pr' ||
+    s === 'pull request' ||
+    s === 'github pull request' ||
+    s.includes('pull request') ||
+    s.includes('pull-request') ||
+    s.includes('merge request') ||
+    (s.includes('pr') && (s.includes('github') || s.includes('gitlab') || s.includes('review') || s.includes('branch')))
+  ) {
+    return 'GITHUB_PULL_REQUEST';
+  }
+
+  // 2. Git Fetch (Downloads remote tracking refs without touching working tree)
+  if (
+    s === 'fetch' ||
+    s === 'git fetch' ||
+    s.includes('git fetch') ||
+    s.includes('git-fetch') ||
+    s.includes('fetch command')
+  ) {
+    return 'GIT_FETCH';
+  }
+
+  // 3. Git Merge (Combines local branch histories)
+  if (
+    (s === 'merge' || s === 'git merge' || s.includes('git merge') || s.includes('merge command')) &&
+    !s.includes('merge request') // merge request is PR
+  ) {
+    return 'GIT_MERGE';
+  }
+
+  // 4. Git Rebase (Replays commits linearly)
+  if (
+    s === 'rebase' ||
+    s === 'git rebase' ||
+    s.includes('git rebase') ||
+    s.includes('rebase command')
+  ) {
+    return 'GIT_REBASE';
+  }
+
+  // 5. Git Pull (CLI composite fetch + merge command)
+  if (
+    s === 'pull' ||
+    s === 'git pull' ||
+    s === 'pull command' ||
+    s.includes('git pull') ||
+    s.includes('git-pull') ||
+    s.includes('pull command') ||
+    s.includes('git pool') ||
+    s.includes('get pull') ||
+    (s.includes('pull') && !s.includes('request'))
+  ) {
+    return 'GIT_PULL';
+  }
+
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // 1. Technical Vocabulary (Engineering, Science, CS, Cybersecurity, Math)
 // ---------------------------------------------------------------------------
 
 const TECHNICAL_VOCABULARY: TechnicalTermDefinition[] = [
   // Multiword Java / OOP Terms
+  { canonical: 'ArrayList', domain: 'java', aliases: ['array list', 'array-list', 'arraylist'], isMultiword: true },
+  { canonical: 'LinkedList', domain: 'java', aliases: ['linked list', 'linkedlist'], isMultiword: false },
+  { canonical: 'HashMap', domain: 'java', aliases: ['hash map', 'hashmap'], isMultiword: false },
+  { canonical: 'TreeMap', domain: 'java', aliases: ['tree map', 'treemap'], isMultiword: false },
+  { canonical: 'HashSet', domain: 'java', aliases: ['hash set', 'hashset'], isMultiword: false },
+  { canonical: 'JVM', domain: 'java', aliases: ['j v m', 'jvm', 'java virtual machine'], coOccursWith: ['java', 'bytecode', 'garbage collection', 'heap', 'stack'], isMultiword: false },
   { canonical: 'checked exception', domain: 'java', aliases: ['checker exception', 'check exception', 'checking exception'], coOccursWith: ['java', 'exception', 'compiler', 'throws', 'try', 'catch', 'unchecked exception'], isMultiword: true },
   { canonical: 'unchecked exception', domain: 'java', aliases: ['unchecker exception', 'uncheck exception', 'unchecking exception'], coOccursWith: ['java', 'runtimeexception', 'runtime', 'exception', 'checked exception'], isMultiword: true },
   { canonical: 'runtime exception', domain: 'java', aliases: ['run time exception'], coOccursWith: ['java', 'unchecked exception', 'exception'], isMultiword: true },
   { canonical: 'compile time exception', domain: 'java', aliases: ['compile-time exception'], coOccursWith: ['java', 'checked exception'], isMultiword: true },
+  { canonical: 'exception handling', domain: 'java', aliases: ['exception handle', 'handling exceptions', 'handle exception'], coOccursWith: ['java', 'try', 'catch', 'finally', 'throw', 'throws', 'exception'], isMultiword: true },
   { canonical: 'method overloading', domain: 'java', aliases: ['method over loading', 'method overloaded'], coOccursWith: ['java', 'signature', 'compile time', 'polymorphism', 'method overriding'], isMultiword: true },
   { canonical: 'method overriding', domain: 'java', aliases: ['method over riding', 'method overridden'], coOccursWith: ['java', 'runtime', 'inheritance', 'polymorphism', 'method overloading', 'override'], isMultiword: true },
   { canonical: 'garbage collection', domain: 'java', aliases: ['garbage collector', 'gc'], coOccursWith: ['memory', 'heap', 'jvm', 'pause'], isMultiword: true },
@@ -68,11 +151,21 @@ const TECHNICAL_VOCABULARY: TechnicalTermDefinition[] = [
   { canonical: 'arrow function', domain: 'javascript', isMultiword: true },
   { canonical: 'strict mode', domain: 'javascript', isMultiword: true },
 
+  // Multiword Git / Version Control Terms
+  { canonical: 'pull request', domain: 'cs_general', aliases: ['pr', 'github pull request', 'merge request', 'pull-request'], coOccursWith: ['git', 'github', 'branch', 'merge', 'review'], isMultiword: true },
+  { canonical: 'git pull', domain: 'cs_general', aliases: ['git-pull', 'pull command', 'git pull command', 'git pool', 'get pull'], coOccursWith: ['git', 'fetch', 'merge', 'remote', 'branch'], isMultiword: true },
+  { canonical: 'git fetch', domain: 'cs_general', aliases: ['git-fetch', 'fetch command', 'git fetch command', 'get fetch'], coOccursWith: ['git', 'pull', 'remote', 'branch', 'origin'], isMultiword: true },
+  { canonical: 'git merge', domain: 'cs_general', aliases: ['git-merge', 'merge command', 'git merge command'], coOccursWith: ['git', 'branch', 'conflict', 'rebase'], isMultiword: true },
+  { canonical: 'git rebase', domain: 'cs_general', aliases: ['git-rebase', 'rebase command', 'git rebase command'], coOccursWith: ['git', 'commit', 'history', 'merge'], isMultiword: true },
+
   // Multiword SQL / Database Terms
   { canonical: 'b-tree', domain: 'sql', aliases: ['b tree', 'bee tree', 'be tree'], coOccursWith: ['index', 'indexing', 'database', 'sql', 'search'], isMultiword: true },
   { canonical: 'lsm tree', domain: 'sql', aliases: ['l s m tree', 'log structured merge tree'], coOccursWith: ['database', 'nosql', 'compaction'], isMultiword: true },
   { canonical: 'primary key', domain: 'sql', isMultiword: true },
   { canonical: 'foreign key', domain: 'sql', isMultiword: true },
+  { canonical: 'truncate table', domain: 'sql', aliases: ['truncate'], coOccursWith: ['sql', 'delete', 'drop', 'table', 'dml', 'ddl'], isMultiword: true },
+  { canonical: 'drop table', domain: 'sql', coOccursWith: ['sql', 'table', 'ddl', 'schema'], isMultiword: true },
+  { canonical: 'delete from', domain: 'sql', coOccursWith: ['sql', 'dml', 'where', 'row'], isMultiword: true },
   { canonical: 'acid properties', domain: 'sql', aliases: ['acid property', 'asset properties'], coOccursWith: ['transaction', 'atomicity', 'consistency', 'isolation', 'durability'], isMultiword: true },
   { canonical: 'connection pool', domain: 'sql', aliases: ['connection pooling'], coOccursWith: ['database', 'sql', 'datasource'], isMultiword: true },
   { canonical: 'composite index', domain: 'sql', isMultiword: true },
@@ -83,12 +176,20 @@ const TECHNICAL_VOCABULARY: TechnicalTermDefinition[] = [
   { canonical: 'context switch', domain: 'os', aliases: ['contact switch', 'context switching'], coOccursWith: ['cpu', 'thread', 'process', 'kernel'], isMultiword: true },
   { canonical: 'virtual memory', domain: 'os', coOccursWith: ['paging', 'mmu', 'page fault', 'ram'], isMultiword: true },
   { canonical: 'inter-process communication', domain: 'os', aliases: ['ipc'], coOccursWith: ['process', 'pipe', 'shared memory', 'socket'], isMultiword: true },
+  { canonical: 'coffman conditions', domain: 'os', aliases: ['coffman condition'], coOccursWith: ['deadlock', 'mutual exclusion', 'hold and wait', 'no preemption', 'circular wait'], isMultiword: true },
+  { canonical: 'mutual exclusion', domain: 'os', coOccursWith: ['deadlock', 'critical section', 'mutex', 'coffman'], isMultiword: true },
+  { canonical: 'hold and wait', domain: 'os', coOccursWith: ['deadlock', 'resource', 'coffman'], isMultiword: true },
+  { canonical: 'circular wait', domain: 'os', coOccursWith: ['deadlock', 'cycle', 'coffman'], isMultiword: true },
+  { canonical: 'stack memory', domain: 'os', aliases: ['stack allocation'], coOccursWith: ['heap memory', 'call stack', 'pointer', 'lifo'], isMultiword: true },
+  { canonical: 'heap memory', domain: 'os', aliases: ['heap allocation'], coOccursWith: ['stack memory', 'dynamic memory', 'garbage collector', 'malloc'], isMultiword: true },
 
   // Multiword Networking Terms
   { canonical: 'three-way handshake', domain: 'networking', aliases: ['3-way handshake', 'tcp handshake'], coOccursWith: ['tcp', 'syn', 'ack', 'connection'], isMultiword: true },
   { canonical: 'load balancer', domain: 'networking', aliases: ['load balance'], coOccursWith: ['reverse proxy', 'nginx', 'traffic', 'server'], isMultiword: true },
   { canonical: 'reverse proxy', domain: 'networking', coOccursWith: ['load balancer', 'nginx', 'caching'], isMultiword: true },
-  { canonical: 'rest api', domain: 'networking', aliases: ['restful api'], coOccursWith: ['http', 'get', 'post', 'endpoint'], isMultiword: true },
+  { canonical: 'REST API', domain: 'networking', aliases: ['rest api', 'rest-api', 'restful api', 'rest apis'], coOccursWith: ['http', 'get', 'post', 'endpoint'], isMultiword: true },
+  { canonical: 'tls handshake', domain: 'networking', aliases: ['ssl handshake'], coOccursWith: ['https', 'tls', 'ssl', 'certificate', 'encryption'], isMultiword: true },
+  { canonical: 'digital certificate', domain: 'networking', aliases: ['ssl certificate', 'tls certificate'], isMultiword: true },
 
   // Multiword CS Concepts
   { canonical: 'compile time', domain: 'cs_general', aliases: ['compile-time'], coOccursWith: ['runtime', 'compiler', 'static'], isMultiword: true },
@@ -119,6 +220,11 @@ const TECHNICAL_VOCABULARY: TechnicalTermDefinition[] = [
   { canonical: 'cross-site scripting', domain: 'cybersecurity', aliases: ['xss'], coOccursWith: ['security', 'vulnerability', 'browser'], isMultiword: true },
   { canonical: 'buffer overflow', domain: 'cybersecurity', coOccursWith: ['memory', 'stack', 'security'], isMultiword: true },
 
+  // Multiword AI / Data Science / NLP Terms
+  { canonical: 'natural language processing', domain: 'cs_general', aliases: ['nlp'], coOccursWith: ['ai', 'text', 'language', 'tokenization', 'llm', 'model', 'chatbots', 'translation'], isMultiword: true },
+  { canonical: 'bag of words', domain: 'cs_general', aliases: ['bow', 'bag-of-words'], coOccursWith: ['nlp', 'text', 'vector', 'vocabulary', 'frequency', 'count'], isMultiword: true },
+  { canonical: 'database normalization', domain: 'sql', aliases: ['normalization in dbms', 'dbms normalization'], coOccursWith: ['1nf', '2nf', '3nf', 'bcnf', 'redundancy', 'anomaly', 'relational', 'table'], isMultiword: true },
+
   // Multiword Mathematics
   { canonical: 'fourier transform', domain: 'mathematics', aliases: ['fft'], coOccursWith: ['frequency', 'signal'], isMultiword: true },
   { canonical: 'laplace transform', domain: 'mathematics', coOccursWith: ['s-domain', 'differential equation'], isMultiword: true },
@@ -147,6 +253,8 @@ const TECHNICAL_VOCABULARY: TechnicalTermDefinition[] = [
   { canonical: 'concurrency', domain: 'os', coOccursWith: ['parallelism', 'thread', 'process', 'race condition'] },
   { canonical: 'parallelism', domain: 'os', coOccursWith: ['concurrency', 'multicore', 'cpu'] },
   { canonical: 'recursion', domain: 'cs_general', coOccursWith: ['base case', 'call stack', 'algorithm'] },
+  { canonical: 'nlp', domain: 'cs_general', aliases: ['n.l.p.'], coOccursWith: ['natural language processing', 'ai', 'text', 'machine learning', 'chatbots'] },
+  { canonical: 'normalization', domain: 'sql', aliases: ['normalize', 'normalized'], coOccursWith: ['database', 'dbms', 'sql', '1nf', '2nf', '3nf', 'redundancy', 'table'] },
   { canonical: 'mosfet', domain: 'electronics', aliases: ['mossfet'], coOccursWith: ['transistor', 'gate', 'drain', 'source'] },
   { canonical: 'diode', domain: 'electronics', coOccursWith: ['rectifier', 'anode', 'cathode', 'pn junction'] },
   { canonical: 'transistor', domain: 'electronics', coOccursWith: ['bjt', 'base', 'collector', 'emitter'] }
@@ -161,17 +269,17 @@ for (const term of TECHNICAL_VOCABULARY) {
   term.phoneticCodes = doubleMetaphone(term.canonical);
 }
 
-const MULTIWORD_TERMS = TECHNICAL_VOCABULARY.filter(t => t.isMultiword);
+const MULTIWORD_TERMS = TECHNICAL_VOCABULARY.filter(t => t.isMultiword || t.canonical.includes(' ') || t.aliases?.some(a => a.includes(' ')));
 const SINGLE_WORD_TERMS = TECHNICAL_VOCABULARY.filter(t => !t.isMultiword);
 
 // Domain keywords used to detect subject context
 const DOMAIN_KEYWORDS: Record<TechDomain, string[]> = {
-  java: ['java', 'jvm', 'jre', 'jdk', 'exception', 'exceptions', 'throw', 'throws', 'catch', 'try', 'spring', 'runtimeexception', 'nullpointerexception', 'byte code', 'bytecode', 'class', 'interface', 'overload', 'override', 'garbage collection'],
+  java: ['java', 'jvm', 'jre', 'jdk', 'exception', 'exceptions', 'exception handling', 'handling', 'throw', 'throws', 'catch', 'try', 'spring', 'runtimeexception', 'nullpointerexception', 'byte code', 'bytecode', 'class', 'interface', 'overload', 'override', 'garbage collection'],
   os: ['os', 'operating system', 'operating systems', 'process', 'processes', 'thread', 'threads', 'concurrency', 'multithreading', 'multiprocessing', 'cpu', 'memory', 'mutex', 'semaphore', 'deadlock', 'scheduling', 'kernel', 'context switch', 'paging', 'virtual memory', 'ipc'],
   javascript: ['javascript', 'js', 'typescript', 'ts', 'node', 'nodejs', 'react', 'frontend', 'browser', 'dom', 'v8', 'event loop', 'closure', 'prototype', 'npm', 'promise', 'async', 'await', 'hoisting'],
-  sql: ['sql', 'database', 'databases', 'rdbms', 'table', 'tables', 'postgres', 'postgresql', 'mysql', 'query', 'indexing', 'index', 'b-tree', 'transaction', 'acid', 'relational', 'nosql', 'sharding', 'foreign key', 'primary key'],
+  sql: ['sql', 'database', 'databases', 'rdbms', 'table', 'tables', 'postgres', 'postgresql', 'mysql', 'query', 'indexing', 'index', 'b-tree', 'transaction', 'acid', 'relational', 'nosql', 'sharding', 'foreign key', 'primary key', 'normalization', 'normal form', '1nf', '2nf', '3nf'],
   networking: ['network', 'networking', 'tcp', 'udp', 'ip', 'http', 'https', 'dns', 'packet', 'socket', 'handshake', 'osi', 'latency', 'bandwidth', 'router', 'gateway', 'load balancer', 'proxy'],
-  cs_general: ['algorithm', 'data structure', 'complexity', 'big-o', 'solid', 'design pattern', 'system design', 'recursion', 'dynamic programming', 'compile time', 'runtime', 'oop'],
+  cs_general: ['algorithm', 'data structure', 'complexity', 'big-o', 'solid', 'design pattern', 'system design', 'recursion', 'dynamic programming', 'compile time', 'runtime', 'oop', 'nlp', 'natural language processing', 'bag of words', 'bow', 'tokenization'],
   electronics: ['electronics', 'electrical', 'voltage', 'current', 'resistance', 'ohm', 'kirchhoff', 'ac', 'dc', 'mosfet', 'transistor', 'diode', 'op-amp', 'circuit', 'capacitance', 'inductance'],
   mechanical: ['mechanical', 'thermodynamics', 'carnot', 'bernoulli', 'fluid', 'stress', 'strain', 'pressure', 'heat', 'engine', 'viscosity'],
   civil: ['civil', 'concrete', 'slump', 'foundation', 'soil', 'beam', 'truss', 'structural', 'surveying'],
@@ -179,18 +287,28 @@ const DOMAIN_KEYWORDS: Record<TechDomain, string[]> = {
   mathematics: ['mathematics', 'math', 'calculus', 'fourier', 'laplace', 'euler', 'derivative', 'integral', 'matrix', 'eigenvalue', 'probability']
 };
 
+// Also index all known domain keywords into CANONICAL_TERMS_SET so legitimate core terms (e.g. 'java', 'react', 'sql')
+// are recognized as canonical and never replaced by acoustic/fuzzy matching.
+for (const keywords of Object.values(DOMAIN_KEYWORDS)) {
+  for (const kw of keywords) {
+    CANONICAL_TERMS_SET.add(kw.toLowerCase());
+    CANONICAL_TERMS_SET.add(kw.toLowerCase() + 's');
+  }
+}
+
 // Negative collocation dictionary: phrases where a word is clearly NON-TECHNICAL and must NOT be replaced
-const NEGATIVE_COLLOCATIONS: Record<string, RegExp[]> = {
+// Guarded with null-prototype dictionary to prevent prototype pollution collisions (e.g., 'constructor', '__proto__')
+const NEGATIVE_COLLOCATIONS: Record<string, RegExp[]> = Object.assign(Object.create(null), {
   throat: [
     /\bthroat\s+(infection|cancer|spray|coat|culture|swab|pain|irritation|lozenge|ache)\b/i,
     /\b(sore|strep|scratchy|swollen|dry|clear|clearing|deep|cut)\s+throat\b/i,
     /\blump\s+in\s+(the\s+|my\s+|a\s+)?throat\b/i
   ]
-};
+});
 
-const NEGATIVE_CONTEXT_WORDS: Record<string, string[]> = {
+const NEGATIVE_CONTEXT_WORDS: Record<string, string[]> = Object.assign(Object.create(null), {
   throat: ['infection', 'infected', 'doctor', 'hospital', 'cough', 'coughing', 'sore', 'tonsil', 'pharynx', 'pain', 'swallow', 'swallowing', 'medical', 'virus', 'bacterial', 'fever', 'medicine', 'sick', 'illness']
-};
+});
 
 // ---------------------------------------------------------------------------
 // 2. Pure TypeScript Double Metaphone Algorithm
@@ -201,7 +319,7 @@ const NEGATIVE_CONTEXT_WORDS: Record<string, string[]> = {
  * Returns [primary, secondary] codes (up to 4-5 chars).
  */
 export function doubleMetaphone(rawWord: string): [string, string] {
-  if (!rawWord) return ['', ''];
+  if (!rawWord || typeof rawWord !== 'string') return ['', ''];
   const word = rawWord.trim().toUpperCase();
   if (word.length === 0) return ['', ''];
 
@@ -420,6 +538,9 @@ export function doubleMetaphone(rawWord: string): [string, string] {
 // ---------------------------------------------------------------------------
 
 export function levenshteinDistance(s1: string, s2: string): number {
+  if (typeof s1 !== 'string' || typeof s2 !== 'string') {
+    return Math.max(typeof s1 === 'string' ? s1.length : 0, typeof s2 === 'string' ? s2.length : 0);
+  }
   const m = s1.length;
   const n = s2.length;
   if (m === 0) return n;
@@ -448,6 +569,7 @@ export function levenshteinDistance(s1: string, s2: string): number {
 }
 
 export function stringSimilarity(s1: string, s2: string): number {
+  if (typeof s1 !== 'string' || typeof s2 !== 'string') return 0;
   const maxLen = Math.max(s1.length, s2.length);
   if (maxLen === 0) return 1.0;
   const dist = levenshteinDistance(s1.toLowerCase(), s2.toLowerCase());
@@ -455,8 +577,9 @@ export function stringSimilarity(s1: string, s2: string): number {
 }
 
 export function phoneticSimilarity(wordA: string, wordB: string, precomputedB?: [string, string]): number {
+  if (typeof wordA !== 'string' || typeof wordB !== 'string') return 0;
   const [pA, sA] = doubleMetaphone(wordA);
-  const [pB, sB] = precomputedB || doubleMetaphone(wordB);
+  const [pB, sB] = (Array.isArray(precomputedB) && precomputedB.length === 2) ? precomputedB : doubleMetaphone(wordB);
 
   // Exact code match
   if (pA === pB || pA === sB || sA === pB || (sA && sB && sA === sB)) {
@@ -481,16 +604,25 @@ export function phoneticSimilarity(wordA: string, wordB: string, precomputedB?: 
 // ---------------------------------------------------------------------------
 
 export function detectContextDomains(query: string, contextHistory: string[] = []): TechDomain[] {
-  const combined = [query, ...contextHistory].join(' ').toLowerCase();
+  if (typeof query !== 'string') return [];
+  const safeHistory = Array.isArray(contextHistory) ? contextHistory : [];
+  const combined = [query, ...safeHistory].join(' ').toLowerCase();
   const detected: TechDomain[] = [];
 
   for (const [domain, keywords] of Object.entries(DOMAIN_KEYWORDS)) {
-    const hasMatch = keywords.some(kw => {
-      const regex = new RegExp(`\\b${kw.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\b`, 'i');
-      return regex.test(combined);
-    });
-    if (hasMatch) {
-      detected.push(domain as TechDomain);
+    if (Array.isArray(keywords)) {
+      const hasMatch = keywords.some(kw => {
+        if (typeof kw !== 'string' || !kw) return false;
+        try {
+          const regex = new RegExp(`\\b${kw.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\b`, 'i');
+          return regex.test(combined);
+        } catch {
+          return false;
+        }
+      });
+      if (hasMatch) {
+        detected.push(domain as TechDomain);
+      }
     }
   }
 
@@ -524,9 +656,14 @@ export function normalizeTechnicalTerms(
   }
 
   const raw = rawText.trim();
-  const historyStrings: string[] = contextHistory.map(h => 
-    typeof h === 'string' ? h : `${h.question} ${h.summary || ''}`
-  );
+  const safeHistory = Array.isArray(contextHistory) ? contextHistory : [];
+  const historyStrings: string[] = safeHistory.map(h => {
+    if (typeof h === 'string') return h;
+    if (h && typeof h === 'object' && 'question' in h) {
+      return `${(h as any).question || ''} ${(h as any).summary || ''}`;
+    }
+    return '';
+  });
 
   const detectedDomains = detectContextDomains(raw, historyStrings);
   const corrections: TermCorrection[] = [];
@@ -778,27 +915,39 @@ export function normalizeTechnicalTerms(
   const KNOWN_SCOPED_DOMAINS = new Set([
     'java', 'python', 'javascript', 'typescript', 'c++', 'cpp', 'golang', 'go', 'rust',
     'c#', 'csharp', 'ruby', 'php', 'swift', 'kotlin', 'scala', 'sql', 'react', 'angular',
-    'vue', 'node', 'nodejs'
+    'vue', 'node', 'nodejs', 'git', 'github', 'database'
   ]);
 
   if (scopedLanguage && KNOWN_SCOPED_DOMAINS.has(scopedLanguage)) {
-    // Interrogative definition query: e.g. "What is [a/an/the]? <TERM> in <TECH>?"
-    const interrogativeMatch = normalized.match(/^(what\s+is\s+(a\s+|an\s+|the\s+)?|explain\s+(the\s+)?|define\s+(the\s+)?|how\s+does\s+(the\s+)?)([a-z0-9_ -]+?)\s+in\s+([a-zA-Z0-9#+.]+)(?:\?|\.|$)/i);
+    // If this is a comparison or compound inquiry, do NOT extract the whole clause as a single suspect term
+    const isComparisonOrCompound = /\b(difference\s+between|compare|vs|versus|differentiate|pros\s+and\s+cons|advantages?\s+of)\b/i.test(normalized);
 
-    if (interrogativeMatch) {
-      const candidateTerm = interrogativeMatch[6]?.trim().toLowerCase();
-      if (candidateTerm && candidateTerm.length >= 3) {
-        const singular = candidateTerm.replace(/e?s$/, '');
-        const isKnown = CANONICAL_TERMS_SET.has(candidateTerm) || 
-                        CANONICAL_TERMS_SET.has(singular) ||
-                        TECHNICAL_VOCABULARY.some(t => t.canonical.toLowerCase() === candidateTerm || t.canonical.toLowerCase() === singular);
-        const isCommonSafeWord = ['difference', 'example', 'feature', 'concept', 'method', 'class', 'function', 'object', 'code', 'error', 'interface', 'variable', 'annotation', 'keyword', 'library', 'package', 'module', 'stream', 'thread', 'loop', 'exception'].includes(candidateTerm);
+    if (!isComparisonOrCompound) {
+      // Interrogative definition query: e.g. "What is [a/an/the]? <TERM> in <TECH>?"
+      const interrogativeMatch = normalized.match(/^(what\s+is\s+(a\s+|an\s+|the\s+)?|explain\s+(the\s+)?|define\s+(the\s+)?|how\s+does\s+(the\s+)?)([a-z0-9_ -]+?)\s+in\s+([a-zA-Z0-9#+.]+)(?:\?|\.|$)/i);
 
-        if (!isKnown && !isCommonSafeWord) {
-          const bestMatch = findClosestTechnicalTerm(candidateTerm);
-          if (bestMatch.similarity < 0.70) {
-            hasUnknownSuspectTerm = true;
-            suspectTerms.push(candidateTerm);
+      if (interrogativeMatch) {
+        const candidateTerm = interrogativeMatch[6]?.trim().toLowerCase();
+        if (candidateTerm && candidateTerm.length >= 3) {
+          const singular = candidateTerm.replace(/e?s$/, '');
+          const isKnown = CANONICAL_TERMS_SET.has(candidateTerm) || 
+                          CANONICAL_TERMS_SET.has(singular) ||
+                          TECHNICAL_VOCABULARY.some(t => t.canonical.toLowerCase() === candidateTerm || t.canonical.toLowerCase() === singular);
+          const isCommonSafeWord = [
+            'difference', 'example', 'feature', 'concept', 'method', 'class', 'function', 'object', 'code', 'error',
+            'interface', 'variable', 'annotation', 'keyword', 'library', 'package', 'module', 'stream', 'thread',
+            'loop', 'exception', 'array', 'arraylist', 'list', 'map', 'hashmap', 'set', 'hashset', 'collection',
+            'collections', 'stack', 'queue', 'deque', 'tree', 'graph', 'node', 'string', 'builder', 'buffer',
+            'pull request', 'git pull', 'git fetch', 'pull', 'fetch', 'merge', 'rebase', 'commit', 'branch',
+            'deadlock', 'mutex', 'semaphore', 'truncate', 'drop', 'delete', 'primary key', 'foreign key'
+          ].includes(candidateTerm);
+
+          if (!isKnown && !isCommonSafeWord) {
+            const bestMatch = findClosestTechnicalTerm(candidateTerm);
+            if (bestMatch.similarity < 0.70) {
+              hasUnknownSuspectTerm = true;
+              suspectTerms.push(candidateTerm);
+            }
           }
         }
       }
@@ -831,25 +980,48 @@ export function normalizeTechnicalTerms(
 
 /**
  * Checks if a word or phrase has a negative collocation (medical, non-technical, etc.)
+ * Strictly validates input types and guards against Object prototype pollution / non-iterable values.
  */
-function hasNegativeCollocation(word: string, fullText: string): boolean {
+export function hasNegativeCollocation(word: unknown, fullText: unknown): boolean {
+  if (typeof word !== 'string' || typeof fullText !== 'string') {
+    return false;
+  }
+  const clean = word.toLowerCase().trim();
   const lower = fullText.toLowerCase();
-  const clean = word.toLowerCase();
+  if (!clean || !lower) return false;
 
   // 1. Direct phrase regexes
-  const regexes = NEGATIVE_COLLOCATIONS[clean];
-  if (regexes) {
-    for (const r of regexes) {
-      if (r.test(lower)) return true;
+  // Safe own-property check prevents prototype lookup (e.g., 'constructor', '__proto__')
+  if (Object.prototype.hasOwnProperty.call(NEGATIVE_COLLOCATIONS, clean)) {
+    const regexes = NEGATIVE_COLLOCATIONS[clean];
+    if (Array.isArray(regexes)) {
+      for (const r of regexes) {
+        if (r && typeof r.test === 'function') {
+          try {
+            if (r.test(lower)) return true;
+          } catch {
+            // Safe fallback if regex test fails
+          }
+        }
+      }
     }
   }
 
   // 2. Neighbor context words
-  const contextWords = NEGATIVE_CONTEXT_WORDS[clean];
-  if (contextWords) {
-    for (const cw of contextWords) {
-      const reg = new RegExp(`\\b${cw}\\b`, 'i');
-      if (reg.test(lower)) return true;
+  if (Object.prototype.hasOwnProperty.call(NEGATIVE_CONTEXT_WORDS, clean)) {
+    const contextWords = NEGATIVE_CONTEXT_WORDS[clean];
+    if (Array.isArray(contextWords)) {
+      for (const cw of contextWords) {
+        if (typeof cw === 'string' && cw.trim()) {
+          try {
+            const escaped = cw.trim().replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+            const reg = new RegExp(`\\b${escaped}\\b`, 'i');
+            if (reg.test(lower)) return true;
+          } catch {
+            // Safe fallback if regex creation or test fails
+          }
+        }
+      }
     }
   }
 
@@ -862,6 +1034,10 @@ function hasNegativeCollocation(word: string, fullText: string): boolean {
 function findClosestTechnicalTerm(term: string): { term: string; similarity: number } {
   let bestTerm = '';
   let maxSim = 0;
+
+  if (!term || typeof term !== 'string') {
+    return { term: '', similarity: 0 };
+  }
 
   for (const t of TECHNICAL_VOCABULARY) {
     const sim = Math.max(

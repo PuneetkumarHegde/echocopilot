@@ -81,13 +81,19 @@ export function encodeWAV(samples: Float32Array, sampleRate = 16000): Blob {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
+import { recordPipelineDiagnostic } from './audioPipelineHelper';
+
 export interface PcmStreamRecorderOptions {
   stream: MediaStream;
   source: 'mic' | 'meeting';
-  onAudioChunk: (blob: Blob, source: 'mic' | 'meeting') => Promise<void> | void;
+  onAudioChunk: (blob: Blob, source: 'mic' | 'meeting', utteranceId: string) => Promise<void> | void;
   onAudioLevel?: (level: number) => void;
   onReceivingAudio?: (receiving: boolean) => void;
+  onSpeechStateChange?: (state: 'idle' | 'speaking' | 'flushing') => void;
   onError?: (err: Error) => void;
+  silenceThresholdMs?: number; // default: 1100ms (500–1500ms)
+  preRollMs?: number;          // default: 350ms (200–400ms)
+  minUtteranceDurationSec?: number; // default: 0.35s
 }
 
 export interface PcmStreamRecorder {
@@ -95,13 +101,25 @@ export interface PcmStreamRecorder {
   pause: () => void;
   resume: () => void;
   isPaused: () => boolean;
+  forceFlush: () => void;
 }
 
 /**
  * Attaches continuous PCM audio processing to a MediaStream and sends speech chunks
  */
 export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmStreamRecorder {
-  const { stream, source, onAudioChunk, onAudioLevel, onReceivingAudio, onError } = options;
+  const { 
+    stream, 
+    source, 
+    onAudioChunk, 
+    onAudioLevel, 
+    onReceivingAudio, 
+    onSpeechStateChange,
+    onError,
+    silenceThresholdMs = 1100,
+    preRollMs = 350,
+    minUtteranceDurationSec = 0.35
+  } = options;
 
   let isPaused = false;
   let isStopped = false;
@@ -120,6 +138,11 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
   if (audioCtx.state === 'suspended') {
     audioCtx.resume().catch((err) => console.warn('[WavRecorder] AudioContext resume error:', err));
   }
+  audioCtx.onstatechange = () => {
+    if (audioCtx.state === 'suspended' && !isPaused && !isStopped) {
+      audioCtx.resume().catch(() => {});
+    }
+  };
 
   const sourceNode = audioCtx.createMediaStreamSource(stream);
   const analyser = audioCtx.createAnalyser();
@@ -153,8 +176,8 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
   };
   animFrameId = requestAnimationFrame(updateMeter);
 
-  // Script processor node (4096 samples = ~256ms at 16kHz)
-  const bufferSize = 4096;
+  // Script processor node (2048 samples = 128ms at 16kHz for responsive low-latency speech detection)
+  const bufferSize = 2048;
   const processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
 
   // Zero gain node prevents audio feedback through speakers
@@ -164,33 +187,63 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
   processor.connect(silenceGain);
   silenceGain.connect(audioCtx.destination);
 
+  const maxPreRollChunks = Math.max(2, Math.ceil(preRollMs / (bufferSize / 16)));
   let preRollChunks: Float32Array[] = [];
   let accumulatedChunks: Float32Array[] = [];
   let totalSamples = 0;
   let isSpeaking = false;
   let silenceSamples = 0;
-  let isProcessingChunk = false;
+  let isDrainingQueue = false;
+  const chunkQueue: Array<{ blob: Blob; utteranceId: string }> = [];
   let noiseFloor = 0.0015;
 
   let lastDiagLog = 0;
-  const tracks = stream.getAudioTracks().map(t => ({ id: t.id, label: t.label, enabled: t.enabled, muted: t.muted, readyState: t.readyState }));
-  console.log(`[WavRecorder] Started PCM stream recorder for source="${source}". AudioContext: sampleRate=${audioCtx.sampleRate}, state=${audioCtx.state}. Tracks:`, tracks);
+  const firstTrack = stream.getAudioTracks()[0];
+  if (firstTrack) {
+    firstTrack.onended = () => {
+      recordPipelineDiagnostic('audio_input', 'warn', `Audio track ended for source=${source}`, { label: firstTrack.label });
+      if (onError) onError(new Error(`AUDIO_TRACK_DISCONNECTED: ${firstTrack.label || source}`));
+    };
+  }
 
-  const flush = async () => {
-    if (isProcessingChunk) {
-      // Don't discard incoming speech! Keep accumulating until previous chunk completes
-      console.log('[WavRecorder] Flush skipped: previous chunk still processing');
-      return;
+  const tracks = stream.getAudioTracks().map(t => ({ id: t.id, label: t.label, enabled: t.enabled, muted: t.muted, readyState: t.readyState }));
+  console.log(`[WavRecorder] Started PCM stream recorder for source="${source}". SampleRate=${audioCtx.sampleRate}, preRollMs=${preRollMs}, silenceThresholdMs=${silenceThresholdMs}. Tracks:`, tracks);
+  recordPipelineDiagnostic('audio_input', 'info', `Started PCM recorder for ${source}`, { tracks, preRollMs, silenceThresholdMs });
+
+  const drainQueue = async () => {
+    if (isDrainingQueue || chunkQueue.length === 0) return;
+    isDrainingQueue = true;
+    try {
+      while (chunkQueue.length > 0) {
+        const item = chunkQueue.shift();
+        if (item) {
+          await onAudioChunk(item.blob, source, item.utteranceId);
+        }
+      }
+    } catch (err: unknown) {
+      console.warn(`[WavRecorder] Error in onAudioChunk:`, err);
+      if (onError && err instanceof Error) onError(err);
+    } finally {
+      isDrainingQueue = false;
+      if (chunkQueue.length > 0) {
+        drainQueue();
+      }
     }
-    // Real spoken utterances must be at least 0.90 seconds long (discard short coughs / clicks)
-    if (totalSamples < 16000 * 0.90 || accumulatedChunks.length === 0) {
-      console.log(`[WavRecorder] Flush discarded: duration=${(totalSamples/16000).toFixed(2)}s < 0.90s threshold, chunks=${accumulatedChunks.length}`);
+  };
+
+  const flush = (force = false) => {
+    const minSamples = Math.round(16000 * minUtteranceDurationSec);
+    if (!force && (totalSamples < minSamples || accumulatedChunks.length === 0)) {
+      console.log(`[WavRecorder] Flush discarded: duration=${(totalSamples/16000).toFixed(2)}s < ${minUtteranceDurationSec}s threshold, chunks=${accumulatedChunks.length}`);
       accumulatedChunks = [];
       totalSamples = 0;
       isSpeaking = false;
       silenceSamples = 0;
+      onSpeechStateChange?.('idle');
       return;
     }
+
+    if (accumulatedChunks.length === 0) return;
 
     const merged = new Float32Array(totalSamples);
     let offset = 0;
@@ -204,10 +257,12 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
     totalSamples = 0;
     isSpeaking = false;
     silenceSamples = 0;
+    onSpeechStateChange?.('flushing');
 
     const wavBlob = encodeWAV(merged, 16000);
-    if (wavBlob.size < 4000) {
-      console.log(`[WavRecorder] Flush discarded: WAV size ${wavBlob.size} bytes < 4000 bytes`);
+    if (wavBlob.size < 1000) {
+      console.log(`[WavRecorder] Flush discarded: WAV size ${wavBlob.size} bytes < 1000 bytes`);
+      onSpeechStateChange?.('idle');
       return;
     }
 
@@ -218,21 +273,18 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
       if (a > peak) peak = a;
     }
 
-    console.log(`[WavRecorder] Speech utterance ready: ${chunkDuration}s (${wavBlob.size} bytes), peak=${peak.toFixed(4)}, audibility=${peak >= 0.015 ? 'AUDIBLE' : 'FAINT_OR_SILENT'} for ${source}`);
+    const utteranceId = `utt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    console.log(`[WavRecorder] Speech utterance ready (${utteranceId}): ${chunkDuration}s (${wavBlob.size} bytes), peak=${peak.toFixed(4)}, audibility=${peak >= 0.010 ? 'AUDIBLE' : 'FAINT'} for ${source}`);
+    recordPipelineDiagnostic('speech_detection', 'success', `Utterance ready: ${chunkDuration}s (peak ${peak.toFixed(4)})`, { durationSec: chunkDuration, sizeBytes: wavBlob.size, peak, source }, utteranceId);
 
-    isProcessingChunk = true;
-    try {
-      await onAudioChunk(wavBlob, source);
-    } catch (err: unknown) {
-      console.warn(`[WavRecorder] Error in onAudioChunk:`, err);
-      if (onError && err instanceof Error) onError(err);
-    } finally {
-      isProcessingChunk = false;
-      // If speech accumulated while processing, flush immediately if ceiling reached or user paused
-      if (totalSamples >= 16000 * 7.5 || (isSpeaking && silenceSamples >= 16000 * 0.55 && totalSamples >= 16000 * 0.85)) {
-        flush();
-      }
+    // Enqueue chunk into bounded queue (max 25 items) to prevent memory leak while accommodating high STT latency
+    if (chunkQueue.length >= 25) {
+      console.warn(`[WavRecorder] Queue overflow (25 chunks pending), dropping oldest chunk to maintain real-time responsiveness`);
+      recordPipelineDiagnostic('speech_detection', 'warn', 'Queue overflow: dropped oldest speech chunk', { queueSize: chunkQueue.length }, utteranceId);
+      chunkQueue.shift();
     }
+    chunkQueue.push({ blob: wavBlob, utteranceId });
+    drainQueue();
   };
 
   processor.onaudioprocess = (e: AudioProcessingEvent) => {
@@ -251,19 +303,18 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
     const rms = Math.sqrt(sum / pcm16k.length);
 
     // Asymmetric noise floor tracking:
-    // Tracks downward quickly when quiet; adapts upward slowly to prevent noise/speech from inflating floor
     if (!isSpeaking) {
       if (rms < noiseFloor) {
         noiseFloor = noiseFloor * 0.85 + rms * 0.15;
       } else {
-        noiseFloor = Math.min(0.025, noiseFloor * 0.992 + rms * 0.008);
+        noiseFloor = Math.min(0.020, noiseFloor * 0.992 + rms * 0.008);
       }
     }
 
-    // Speech detection thresholds:
-    // Requires clear voice above noise floor (at least 0.018) to trigger speech.
-    const speechStartThreshold = Math.max(0.018, noiseFloor * 2.5);
-    const speechContinueThreshold = Math.max(0.010, noiseFloor * 1.5);
+    // Adaptive speech detection thresholds:
+    // Supports quiet, normal, and loud speech while rejecting continuous background noise
+    const speechStartThreshold = Math.max(0.012, noiseFloor * 2.2);
+    const speechContinueThreshold = Math.max(0.007, noiseFloor * 1.4);
 
     const now = Date.now();
     if (!isSpeaking) {
@@ -271,23 +322,25 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
         console.log(`[WavRecorder] SPEECH_START: rms=${rms.toFixed(5)} >= threshold=${speechStartThreshold.toFixed(5)}, noiseFloor=${noiseFloor.toFixed(5)}`);
         isSpeaking = true;
         silenceSamples = 0;
-        // Prepend pre-roll buffer (~500ms) so the first syllables of words are never clipped
+        onSpeechStateChange?.('speaking');
+
+        // Prepend rolling pre-roll buffer so the first syllable/word is never clipped
         accumulatedChunks = [...preRollChunks, pcm16k];
         totalSamples = accumulatedChunks.reduce((acc, c) => acc + c.length, 0);
         preRollChunks = [];
       } else {
-        if (now - lastDiagLog > 3000) {
+        if (now - lastDiagLog > 4000) {
           lastDiagLog = now;
           console.log(`[WavRecorder] IDLE: rms=${rms.toFixed(5)}, noiseFloor=${noiseFloor.toFixed(5)}, startThreshold=${speechStartThreshold.toFixed(5)}`);
         }
-        // Keep a rolling 2-chunk (~500ms) pre-roll buffer while idle
+        // Keep a rolling pre-roll buffer while idle (e.g. ~350ms)
         preRollChunks.push(pcm16k);
-        if (preRollChunks.length > 2) {
+        if (preRollChunks.length > maxPreRollChunks) {
           preRollChunks.shift();
         }
       }
     } else {
-      // While speaking: keep recording
+      // While speaking: accumulate speech samples
       accumulatedChunks.push(pcm16k);
       totalSamples += pcm16k.length;
 
@@ -302,18 +355,18 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
         console.log(`[WavRecorder] SPEAKING: duration=${(totalSamples/16000).toFixed(2)}s, silence=${(silenceSamples/16000).toFixed(2)}s, rms=${rms.toFixed(5)}`);
       }
 
-      // Natural pause at end of question (~650ms of quiet)
-      const silenceThreshold = 16000 * 0.65;
-      const minSpeechSamples = 16000 * 0.75;
+      // Configurable silence threshold (default 700ms, range 500–900ms)
+      const silenceThresholdSamples = Math.round(16000 * (silenceThresholdMs / 1000));
+      const minSpeechSamples = Math.round(16000 * minUtteranceDurationSec);
 
-      if (totalSamples >= minSpeechSamples && silenceSamples >= silenceThreshold) {
+      if (totalSamples >= minSpeechSamples && silenceSamples >= silenceThresholdSamples) {
         console.log(`[WavRecorder] SILENCE_END: totalSamples=${totalSamples} (${(totalSamples/16000).toFixed(2)}s), silenceSamples=${silenceSamples} >= silenceThreshold. Flushing.`);
         flush();
       }
     }
 
-    // Maximum speech chunk ceiling (8.0 seconds) allowing complete technical questions
-    if (totalSamples >= 16000 * 8.0) {
+    // Maximum speech chunk ceiling (15.0 seconds) allowing complete technical questions without premature truncation
+    if (totalSamples >= 16000 * 15.0) {
       console.log(`[WavRecorder] MAX_CHUNK_CEILING reached: ${(totalSamples/16000).toFixed(2)}s. Flushing.`);
       flush();
     }
@@ -339,6 +392,10 @@ export function startPcmStreamRecorder(options: PcmStreamRecorderOptions): PcmSt
         audioCtx.resume().catch(() => {});
       }
     },
-    isPaused: () => isPaused
+    isPaused: () => isPaused,
+    forceFlush: () => {
+      console.log('[WavRecorder] Manual force flush requested');
+      flush(true);
+    }
   };
 }

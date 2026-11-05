@@ -1,127 +1,94 @@
-# EchoCopilot: Practical AI Interview Assistant (ParakeetAI-Inspired)
+# EchoCopilot: Personalized AI Career & Real-Time Interview Assistant
 
-An enterprise-grade, real-time AI interview copilot and preparation studio inspired by [ParakeetAI](https://www.parakeet-ai.com/). Built for candidates and engineers seeking low-latency live assistance, voice-based mock interviews, resume ATS keyword diagnostics, and comprehensive question practice.
+An enterprise-grade, real-time AI interview copilot and personalized career studio inspired by [ParakeetAI](https://www.parakeet-ai.com/). Built for candidates and engineers seeking low-latency live assistance, voice-based mock interviews, project-aware preparation, authentic personalized answer synthesis, resume keyword diagnostics, and transparent local persistence.
 
 ---
 
 ## 🌟 Key Functional Modules
 
-### 1. Live AI Copilot
-- **Three Audio Input Modes:**
-  1. **Microphone Audio (Candidate):** Captures the candidate's voice via `navigator.mediaDevices.getUserMedia()`. Transcribed via browser Web Speech STT. Ideal for mock interviews, practice, and spoken questions.
-  2. **Device / Meeting Audio (Interviewer):** Captures audio from a user-selected Google Meet / Zoom browser tab via `navigator.mediaDevices.getDisplayMedia({ audio: true })`. Transcribed via streaming backend STT (`/api/transcribe`) using Deepgram Nova-2 or OpenAI Whisper.
-  3. **Both (Microphone + Device Audio):** Captures microphone and meeting audio simultaneously while preserving the identity of each source throughout processing (`👤 You (Candidate)` vs `🎧 Meeting (Interviewer)`).
-- **Feedback Loop Prevention:**
-  - Prevents the recursive loop where reading an AI answer aloud transcribes your own voice and triggers another answer.
-  - Dedicated **Answer Trigger Policy** selector:
-    - `🎧 Meeting Audio Only (Recommended)`: Only the interviewer's speech triggers AI answers. Your microphone voice is transcribed as "You" but never invokes AI.
-    - `🎙️ Microphone Only`: Only your microphone triggers answers (for mock interview practice).
-    - `🌐 Both`: Both sources trigger answers.
-- **Audio Lifecycle & Track Monitoring:**
-  - Complete **Start**, **Pause**, **Resume**, and **Stop** controls.
-  - Active audio level visualizers for both Candidate Mic and Meeting Tab audio.
-  - Clean switching between audio sources without leaking media tracks or AudioContext instances.
-  - Automatic detection and cleanup when tab sharing is stopped via browser notification bar (`track.onended`).
-- **Utterance Segmentation & Question Deduplication:**
-  - Detects completed question utterances and filters out conversational filler words.
-  - 30-second deduplication cache prevents repeated STT events from firing redundant AI answer generations.
-- **Pipeline Status States:** Real-time visibility into `Idle`, `Listening`, `Paused`, `Transcribing`, `Generating Answer`, `Answer Ready`, and `Error`.
+### 1. Personal Profile and Career Context
+- **Comprehensive Career Modeling:** Manage academic background, technical skills, career goals, target roles, work experience, hackathons, certifications, strengths/growth areas, and real production outages solved.
+- **Incomplete-Friendly & Authentic:** Never assumes or fabricates missing information. Supports leaving fields blank, and explicitly prompts to fill missing details when generating interview answers.
+- **Import / Export Backup:** One-click JSON backup export and import with instant local IndexedDB persistence.
 
-### 2. AI Voice Mock Interview
-- **Job Role & Seniority Customization:** Select target discipline (Frontend, Backend, Full-Stack, System Design, Behavioral) and level (Junior, Mid-Level, Senior, Staff/Lead).
-- **Interactive Question Sequencer:** Real questions generated dynamically. Includes optional **Text-to-Speech (TTS)** reading the prompt aloud.
-- **Spoken or Typed Answers:** Candidates can speak their answer via microphone (speech-to-text) or type into the response box.
-- **Multi-Dimensional Rubric Feedback:** Instant turn-by-turn scoring across **Correctness (1-10)**, **Clarity (1-10)**, **Completeness (1-10)**, and **Communication (1-10)** with constructive suggestions and intelligent follow-up questions.
-- **Performance Report:** Final scorecard with overall match score (0-100), executive summary, prioritized action items, and exportable Markdown report.
+### 2. Project Vault & Secret-Shielded Codebase Analyzer
+- **In-Depth Project Ingestion:** Stores problem statements, target users, architecture overviews, technology choices, database schemas, API design patterns, and known limitations.
+- **Verified Personal Contributions:** Explicit verification checklist ensuring candidates confirm which modules they personally designed and coded vs. team code.
+- **🛡️ Secret & Credential Shield:** Automatically rejects `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, and `credentials.json`. Detects and redacts OpenAI, Anthropic, AWS keys, JWT tokens, and database passwords before indexing.
+- **Future Improvements Reflection:** Captures architectural reflections (*"What would you improve if you rebuilt your project from scratch today?"*).
 
-### 3. Resume & Keyword Match Analyzer
-- **Document Text Extraction:** Upload `.txt` or `.pdf` files, or paste raw text.
-- **Job Description Target Matching:** Compares candidate competencies against target job requirements.
-- **Transparent Match Score:** Computes a transparent heuristic score (0-100%) with an explicit compliance disclaimer: *"Transparent heuristic match score based on keyword density and competency overlap, not an official ATS vendor proprietary score."*
-- **Skill Gap Detection:** Identifies matched skills and highlights missing high-value keywords.
-- **STAR Bullet Point Rewriter:** Transforms passive resume bullets into metric-driven achievements using action verbs and quantifiable results.
-- **Report Export:** Instant download of the full diagnostic report in Markdown.
+### 3. Automatic Personalized Question Generation
+- Dynamic synthesis cross-referencing profile, active projects, resume, and target job descriptions.
+- Automatically generates questions across 6 core categories:
+  - **Technology Choice Rationale:** *"Why did you choose Java?"*, *"Why did you use PostgreSQL instead of MongoDB?"*
+  - **Career & Specialization Alignment:** *"Why did you choose your degree?", "How does your cybersecurity background help in software development?"*
+  - **Verified Project Contributions:** *"What was your specific personal contribution to EchoCopilot?"*
+  - **System Architecture & Trade-offs:** *"What architectural trade-offs did you consider when designing the system?"*
+  - **Toughest Technical Challenges:** *"What was the most difficult technical problem you solved?"*
+  - **Rebuild & Improvement Foresight:** *"What would you improve if you rebuilt your project from scratch today?"*
 
-### 4. Interview Question Bank
-- **Extensive Real-World Library:** Curated, production-grade questions covering **Java**, **SQL**, **Data Structures & Algorithms**, **Cybersecurity**, **Behavioral**, and **System Design**.
-- **Comprehensive Solution Drawers:** Detailed technical breakdown, executable code snippets, time/space complexity, and common candidate pitfalls.
-- **Search & Multi-Tag Filters:** Filter by company (Google, Amazon, Meta, Stripe), category, and difficulty.
-- **Local Favorites:** Star questions with instant local persistence.
-- **One-Click Practice Transfer:** Click *"Practice in Live Copilot"* on any question to automatically load it into the Live Copilot workspace.
-- **Custom Question Creator:** Add and persist original questions locally.
+### 4. Authentic 4-Part Answer Generation & Anti-Hallucination Guard
+- **Strict 4-Part Natural Structure:**
+  1. **Direct Answer:** Crisp, confident response speakable in 5–15 seconds.
+  2. **Personal Motivation:** Grounded in your real profile reasons.
+  3. **Supporting Real-World Example:** Concrete episode from your verified projects or challenge logs.
+  4. **Connection to Target Role / Goals:** Direct tie-in to target job responsibilities.
+- **Configurable Answer Lengths:** Short (30s elevator pitch), Medium (spoken conversational), or Detailed (deep architectural narrative).
+- **Anti-Hallucination Guardrail:** Never invents achievements or technical motivations. If required context is missing, returns an interactive prompt to answer and save directly to your profile.
 
-### 5. Session History & Persistence
-- **Local IndexedDB Database:** Persistent client-side database (`EchoInterviewCopilotDB`) storing complete transcripts, AI answers, and metadata without cloud transmission.
-- **Search & Filter:** Find past sessions by title, date, or transcript keywords.
-- **Inline Renaming & Deletion:** Manage past records cleanly.
-- **Multi-Format Export:** Export full session transcripts and AI answers as Markdown (`.md`) or Plain Text (`.txt`).
+### 5. Interview Practice Studio (5 Practice Tracks)
+- **5 Dedicated Tracks:**
+  1. `Technical Interview Practice`: Language choice rationale, DB trade-offs, concurrency, algorithms.
+  2. `Project Deep-Dive Interviews`: Architecture defense, verified contributions, hardest bugs, rebuild reflections.
+  3. `HR & Behavioral Practice`: Culture fit, degree choice, career ambitions, domain advantages.
+  4. `Resume-Based Exploration`: Drill-down on resume bullet claims and metrics.
+  5. `Job-Description Tailored`: Simulated round targeting exact requirements in a target job listing.
+- **Answer-First Mode:** Candidate answers first (voice or typed); benchmark suggested answer is hidden until candidate submits or requests to reveal it.
+- **4-Metric Rubric Scoring:** Turn-by-turn evaluation across **Correctness (1-10)**, **Clarity (1-10)**, **Relevance (1-10)**, and **Confidence of Wording (1-10)**.
+- **Adaptive Follow-Up Questions:** Generates dynamic follow-ups based directly on the candidate's previous response.
 
-### 6. Floating Electron Desktop HUD & Screen-Capture Privacy
-- **Frameless Transparent Overlay:** Floats above Google Meet, Zoom, Microsoft Teams, and coding IDEs with native `alwaysOnTop: 'screen-saver'` behavior.
-- **Collapsible Mini State:** Minimize to a subtle 72x72 circular indicator or expand into the full dual-panel HUD (Live Transcript + Structured AI Answers).
-- **🛡️ Screen-Capture Privacy (Anti-Screen Recording):** Configurable native protection using Electron's `BrowserWindow.setContentProtection(true)` (Windows `WDA_EXCLUDEFROMCAPTURE` / macOS `NSWindowSharingNone`). The overlay remains 100% visible and interactive on your monitor, while being hidden/excluded from screen-sharing meeting software and desktop recorders.
-- **100% Offline AI & STT:** Operates locally using Faster-Whisper offline transcription and local Ollama (`qwen2.5:3b` / `llama3.2:1b`) with zero mandatory cloud dependence.
+### 6. Live AI Copilot
+- **Three Audio Input Modes:** Microphone Audio (Candidate), Meeting Audio (Interviewer tab via `getDisplayMedia`), or Both simultaneously with speaker separation.
+- **Feedback Loop Prevention:** Prevents reading AI answers aloud from triggering self-transcription loops.
+- **Active Context Injection:** Live Copilot answers are enriched by your active personal profile and verified projects.
+
+### 7. Session History & Local IndexedDB Persistence
+- **Client-Side IndexedDB (v2):** Dedicated stores for `userProfile`, `projects`, `jobDescriptions`, `sessions`, `favorites`, `customQuestions`, and `practiceHistory`.
+- **Zero Cloud Leakage:** All candidate profiles, project architectures, and session transcripts stay 100% private in browser storage.
 
 ---
 
 ## 🛠️ Technology Stack
 
 - **Framework:** Next.js 16+ (App Router, Turbopack, TypeScript)
-- **Styling:** Tailwind CSS v4 with custom dark-mode theme, emerald/teal accents, and custom scrollbars
+- **Styling:** Tailwind CSS v4 with custom dark-mode theme, emerald/teal accents
 - **Icons:** Lucide React
 - **Audio & Speech:** Web Audio API, Web Speech API (`SpeechRecognition`), Screen/Tab Audio MediaStream (`getDisplayMedia`)
-- **Persistence:** Browser IndexedDB with automated LocalStorage fallback
-- **Server API:** Next.js Route Handlers (`/api/copilot`, `/api/mock`, `/api/resume`, `/api/health`)
+- **Persistence:** Browser IndexedDB v2 with automated LocalStorage fallback
+- **Server API:** Next.js Route Handlers (`/api/copilot`, `/api/personalized-answer`, `/api/personalized-questions`, `/api/mock`, `/api/resume`, `/api/health`)
 
 ---
 
 ## 🚀 Setup & Running Locally
 
-### Prerequisites
-- Node.js 18.17+ or 20+ (tested and verified on Node v22)
-- npm 9+ or 10+
-- Google Chrome or Microsoft Edge recommended for native browser speech-to-text.
-
 ### 1. Installation
-Navigate to the project directory:
 ```bash
-cd parakeet-copilot
 npm install
 ```
 
-### 2. Environment Configuration (Optional)
-The application is **100% functional out-of-the-box** using its Smart Built-in Engine and browser Web Speech STT. To connect live external LLMs (Claude 3.5 Sonnet or GPT-4o), create a `.env.local` file:
-```bash
-cp .env.example .env.local
-```
-Add your API keys:
-```env
-# Optional: OpenAI API Key for GPT-4o
-OPENAI_API_KEY=sk-...
-
-# Optional: Anthropic API Key for Claude 3.5 Sonnet
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: Deepgram API Key for cloud STT
-DEEPGRAM_API_KEY=...
-```
-
-### 3. Run Development Server (Web Mode)
+### 2. Run Development Server
 ```bash
 npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) in Google Chrome or Microsoft Edge.
 
-### 4. 1-Click Launching Desktop Floating HUD (Windows Offline Mode)
-Whenever you want to use the offline desktop floating HUD:
-- Simply double-click **`start-desktop.bat`** in the project directory.
-- It will automatically:
-  1. Detect and start Ollama local AI (`http://127.0.0.1:11434`)
-  2. Start Faster-Whisper local offline STT (`http://127.0.0.1:5001`)
-  3. Start the local server
-  4. Launch the transparent floating Electron HUD with Screen-Capture Privacy active!
+### 3. Run Automated Verification Test Suite
+```bash
+npm test
+```
+Runs the full 43-assertion verification suite validating secret sanitization, codebase analysis, question generation, 4-part answer synthesis, anti-hallucination guardrails, and practice rubric scoring.
 
-### 5. Build for Production
+### 4. Build for Production
 ```bash
 npm run build
 npm run start
@@ -133,21 +100,17 @@ npm run start
 
 | Module | Verification Step | Expected Result |
 | :--- | :--- | :--- |
-| **Live Copilot** | Click "Start Live Copilot", allow microphone access, and speak: *"How does Redis handle master-slave replication?"* | Words transcribe in real-time in the left pane; clicking "Get Answer" renders a structured response with trade-offs. |
-| **Tab Audio** | Click "Capture Tab Audio", select an open video or meeting tab, and check "Share audio". | Tab audio stream connects without crashing; browser indicator displays active audio track. |
-| **Manual Input** | Type *"Implement LRU Cache in TypeScript"* into the Copilot input bar and press Enter. | Instant AI solution card displays with full TypeScript class, `O(1)` complexity, and copy button. |
-| **Mock Interview** | Select "Frontend Engineer" -> "Senior", click "Begin Mock Interview", and speak or type an answer. | Turn evaluation displays 4 rubric scores (Correctness, Clarity, Completeness, Communication), follow-up question, and final scorecard upon completion. |
-| **Resume Analyzer** | Click "Load Sample Resume" and click "Analyze Resume". | Generates a 0-100% competency match score, highlights missing keywords, and renders 3 STAR bullet rewrites. |
-| **Question Bank** | Search "ConcurrentHashMap", expand solution, click star icon, and click "Practice in Live Copilot". | Solution expands with code and complexity; star saves to IndexedDB; transitions to Copilot with question ready. |
-| **Session History** | In Copilot, click "Save Session", navigate to "Session History". | Session appears with transcript turns and answers; clicking "Export MD" downloads a clean Markdown file. |
+| **Personal Profile** | Open "Career Profile", add or edit Education, Skills, Career Goals, or Real Challenges; click "Save Profile". | Saves instantly to local IndexedDB; persists on page reload. |
+| **Project Vault** | Open "Project Vault", click "Import / Analyze Code", upload source files. | Analyzes architecture, identifies tech stack, detects/redacts secrets, and populates verified contributions checklist. |
+| **Question Generator** | Open "Practice Studio", select "Technical" or "Project Deep-Dive", click "Begin Practice". | Generates personalized questions: *"Why did you choose Java?"*, *"Why PostgreSQL over MongoDB?"*, *"What was your specific contribution to EchoCopilot?"*. |
+| **Answer-First Mode** | Speak or type an answer in Practice Studio without revealing the model answer; click "Evaluate My Answer". | Evaluates 4 scores (Correctness, Clarity, Relevance, Confidence), flags hesitant wording, and generates an adaptive follow-up question. |
+| **Anti-Hallucination** | Ask a question regarding a missing profile field in Copilot or API. | Returns targeted follow-up prompt rather than fabricating an answer. |
+| **Automated Suite** | Run `npm test` in the terminal. | Runs 43 automated assertions with 100% pass rate. |
 
 ---
 
 ## 🔒 Limitations & Explicit Exclusions
 
-As requested by the project requirements, the following features are intentionally excluded:
-- **No Marketing / Billing Bloat:** No landing sales funnels, Stripe credit purchasing, or OAuth signups.
-- **Zero Cloud Leakage:** All session transcripts and question favorites remain private in client-side IndexedDB.
+- **Zero Cloud Leakage:** All session transcripts, career profiles, and project vaults remain private in client-side IndexedDB.
 - **Browser Speech-to-Text Support:** The Web Speech API is supported natively in **Google Chrome**, **Microsoft Edge**, and Chromium browsers. On Firefox/Safari, manual text input is available as a zero-friction fallback.
-- **Browser vs. Desktop Audio Capture Limitation:** Web applications capture meeting audio through the W3C DisplayMedia API (`navigator.mediaDevices.getDisplayMedia({ audio: true })`), which allows capturing audio from open browser tabs (Google Meet, Zoom Web, Microsoft Teams web) in Chromium browsers when the user enables "Share tab audio". Capturing system-wide audio from native desktop binaries (such as `Zoom.exe` or `Teams.exe`) without sharing a tab requires a native desktop application with virtual audio loopback drivers (e.g. Windows WASAPI loopback or virtual audio cables).
-- **ATS Score Disclaimer:** Resume scores represent algorithmic keyword overlap and competency mapping, not vendor-proprietary scoring from Workday or Taleo.
+- **No Marketing Bloat:** Free of landing page sales funnels, Stripe credit purchasing, or forced account creation.

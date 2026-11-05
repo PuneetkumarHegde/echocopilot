@@ -247,3 +247,78 @@ export function formatAudioErrorMessage(err: unknown): string {
       return errorObj.message || 'Failed to capture audio stream.';
   }
 }
+
+// -------------------------------------------------------------
+// Timestamped Diagnostic Event Logging for Audio Pipeline Stages
+// -------------------------------------------------------------
+
+export type PipelineDiagnosticStage =
+  | 'audio_input'
+  | 'speech_detection'
+  | 'transcription'
+  | 'question_filter'
+  | 'generation'
+  | 'display';
+
+export interface PipelineDiagnosticEvent {
+  id: string;
+  utteranceId?: string;
+  requestId?: number;
+  stage: PipelineDiagnosticStage;
+  status: 'info' | 'success' | 'warn' | 'error';
+  message: string;
+  details?: Record<string, unknown>;
+  timestamp: number;
+}
+
+const MAX_DIAGNOSTIC_HISTORY = 100;
+const diagnosticHistory: PipelineDiagnosticEvent[] = [];
+
+/**
+ * Records a timestamped diagnostic event across any audio pipeline stage.
+ * Used to diagnose why speech was missed (audio input, speech detection, transcription, filter, generation, or display).
+ */
+export function recordPipelineDiagnostic(
+  stage: PipelineDiagnosticStage,
+  status: 'info' | 'success' | 'warn' | 'error',
+  message: string,
+  details?: Record<string, unknown>,
+  utteranceId?: string,
+  requestId?: number
+): PipelineDiagnosticEvent {
+  const event: PipelineDiagnosticEvent = {
+    id: `diag_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    stage,
+    status,
+    message,
+    details,
+    utteranceId,
+    requestId,
+    timestamp: Date.now()
+  };
+
+  diagnosticHistory.push(event);
+  if (diagnosticHistory.length > MAX_DIAGNOSTIC_HISTORY) {
+    diagnosticHistory.shift();
+  }
+
+  // Also log to console with clear bracketed prefix
+  const prefix = `[PipelineDiag:${stage.toUpperCase()}]`;
+  if (status === 'error') {
+    console.error(prefix, message, details || '');
+  } else if (status === 'warn') {
+    console.warn(prefix, message, details || '');
+  } else {
+    console.log(prefix, message, details || '');
+  }
+
+  return event;
+}
+
+export function getRecentPipelineDiagnostics(limit = 30): PipelineDiagnosticEvent[] {
+  return diagnosticHistory.slice(-limit);
+}
+
+export function clearPipelineDiagnostics(): void {
+  diagnosticHistory.length = 0;
+}

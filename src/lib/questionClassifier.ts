@@ -31,6 +31,20 @@ export interface ClassificationResult {
   reason: string;
   isFollowUp: boolean;
   parentTopicHint?: string;
+  extractedContext?: string;
+  extractedQuestions?: string[];
+}
+
+export interface ExtractedQuestionContext {
+  hasQuestion: boolean;
+  context: string;
+  questions: string[];
+  primaryQuestion: string;
+  intent: UtteranceIntent;
+  category: QuestionCategory;
+  confidence: number;
+  reason: string;
+  isFollowUp: boolean;
 }
 
 export interface QuestionReadinessResult {
@@ -90,6 +104,18 @@ const FOLLOW_UP_REGEX = /^(why\??|why\s+is\s+that\??|why\s+so\??|how\s+so\??|wha
 
 // Interrogative starters indicating genuine questions
 const QUESTION_STARTERS_REGEX = /^(what|why|how|when|where|which|who|whom|whose|explain|describe|define|implement|design|write\s+a|write\s+code|compare|differentiate|walk\s+me\s+through|solve|tell\s+me\s+about|can\s+you|could\s+you|would\s+you|is\s+it|are\s+there|does|do\s+you|have\s+you|should\s+we|will\s+this|give\s+an\s+example|calculate|compute|derive|evaluate|state|find|analyze|discuss|outline|summarize|determine|estimate|demonstrate|illustrate|clarify|provide)\b/i;
+
+// Transitional scenario preambles that introduce context before a question
+export const SCENARIO_PREAMBLE_REGEX = /^(?:considering\s+(?:all\s+)?(?:of\s+)?(?:these|the|this|our|the\s+above)\s+(?:requirements|scenario|context|points|constraints|architecture)|given\s+this\s+(?:scenario|architecture|problem|context|setup)|in\s+this\s+scenario|based\s+on\s+this|with\s+that\s+in\s+mind|so\b),?\s*/i;
+
+// Conversational and interrogative question patterns anywhere in a sentence or clause
+export const INTERROGATIVE_PATTERNS = [
+  /^(what|why|how|when|where|which|who|whom|whose)\b/i,
+  /^(can\s+you|could\s+you|would\s+you|will\s+you|do\s+you|have\s+you|are\s+there|is\s+there|is\s+it|should\s+we|does)\b/i,
+  /\b(how\s+would\s+you|what\s+would\s+be\s+your|what\s+is\s+your\s+approach|how\s+do\s+you\s+handle|how\s+to\s+handle|how\s+should\s+we|which\s+one\s+would\s+you|can\s+you\s+explain|could\s+you\s+explain|can\s+you\s+describe)\b/i,
+  /\b(explain\b|describe\b|walk\s+me\s+through\b|tell\s+me\s+about\b|differentiate\b)/i,
+  /\b(difference\s+between|differences\s+between|compare|vs|versus|trade-?offs?\s+between)\b/i
+];
 
 // Core Technical & Engineering Interview Keywords
 const TECHNICAL_TOPICS = [
@@ -251,6 +277,118 @@ export function extractKeywords(text: string): string[] {
   return TECHNICAL_TOPICS.filter(kw => lower.includes(kw));
 }
 
+/**
+ * Determines whether a clause or sentence represents an interrogative question
+ * or an interviewer prompt directive (e.g. "explain how...", "how would you...", "?").
+ */
+export function isQuestionClause(text: string): boolean {
+  const clean = text.trim();
+  if (!clean || clean.length < 2) return false;
+  if (clean.endsWith('?')) return true;
+  const stripped = clean.replace(SCENARIO_PREAMBLE_REGEX, '').trim();
+  if (stripped.endsWith('?')) return true;
+
+  // Guard: Candidate stating they can or will explain is NOT a question
+  const isCandidateExplanation = /^(?:i\s+(?:can|will|want\s+to|would\s+like\s+to|have)|let\s+me|we\s+(?:can|will|should|have))\s+(?:explain|describe|tell|walk)\b/i.test(stripped);
+  if (isCandidateExplanation) return false;
+
+  if (isDualConceptComparison(clean).isDual || isDualConceptComparison(stripped).isDual) return true;
+  return INTERROGATIVE_PATTERNS.some(p => p.test(stripped) || p.test(clean));
+}
+
+/**
+ * Splits multi-sentence speech while safely protecting version numbers,
+ * decimals (e.g. 2.0, 3.2), and common technical terms (e.g. node.js, next.js).
+ */
+export function splitUtteranceSentences(text: string): string[] {
+  const protectedText = text
+    .replace(/(\d+)\.(\d+)/g, '$1__DECIMAL__$2')
+    .replace(/([a-zA-Z0-9]+)\.([a-zA-Z0-9]+)/g, '$1__DOT__$2');
+
+  const parts = protectedText.split(/(?<=[.?!;])\s+(?=[A-Za-z0-9"'])/);
+  return parts.map(p => p.replace(/__DECIMAL__/g, '.').replace(/__DOT__/g, '.').trim()).filter(Boolean);
+}
+
+/**
+ * Decomposes an incoming speech utterance into interviewer scenario context
+ * and the actual question(s) asked.
+ * Supports long 30-60+ second interviewer explanations ending with a question.
+ */
+export function extractQuestionAndContext(rawText: string): ExtractedQuestionContext {
+  const clean = rawText.trim().replace(/\s+/g, ' ');
+  if (!clean || clean.length < 2) {
+    return {
+      hasQuestion: false,
+      context: '',
+      questions: [],
+      primaryQuestion: '',
+      intent: 'INCOMPLETE_FRAGMENT',
+      category: 'GENERAL',
+      confidence: 1.0,
+      reason: 'Empty or sub-threshold length',
+      isFollowUp: false
+    };
+  }
+
+  const sentences = splitUtteranceSentences(clean);
+  const contextParts: string[] = [];
+  const questionParts: string[] = [];
+
+  for (let i = 0; i < sentences.length; i++) {
+    const s = sentences[i];
+
+    // Check if sentence starts with a scenario preamble (e.g. "Considering the above requirements, explain...")
+    if (SCENARIO_PREAMBLE_REGEX.test(s)) {
+      const match = s.match(SCENARIO_PREAMBLE_REGEX);
+      if (match) {
+        const preamble = match[0].trim();
+        const afterPreamble = s.slice(match[0].length).trim();
+        if (isQuestionClause(afterPreamble)) {
+          if (preamble) contextParts.push(preamble);
+          questionParts.push(afterPreamble);
+          continue;
+        }
+      }
+    }
+
+    if (isQuestionClause(s)) {
+      questionParts.push(s);
+    } else {
+      contextParts.push(s);
+    }
+  }
+
+  const hasQuestion = questionParts.length > 0;
+  const primaryQuestion = questionParts.join(' ');
+  const context = contextParts.join(' ');
+
+  // Determine category
+  let category: QuestionCategory = 'GENERAL';
+  if (isDualConceptComparison(primaryQuestion).isDual || DIFFERENCE_REGEX.test(primaryQuestion)) {
+    category = 'DIFFERENCE';
+  } else if (HOW_WHY_REGEX.test(primaryQuestion)) {
+    category = 'HOW_WHY';
+  } else if (FOLLOW_UP_REGEX.test(clean) || (clean.split(/\s+/).length <= 4 && /^(why|how so)\??$/i.test(clean))) {
+    category = 'FOLLOW_UP';
+  } else if (primaryQuestion.split(/\s+/).length <= 15 && !primaryQuestion.toLowerCase().includes('compare') && !primaryQuestion.toLowerCase().includes('difference')) {
+    category = 'DIRECT';
+  }
+
+  return {
+    hasQuestion,
+    context,
+    questions: questionParts,
+    primaryQuestion,
+    intent: hasQuestion ? 'GENUINE_QUESTION' : 'STATEMENT',
+    category,
+    confidence: hasQuestion ? 0.92 : 0.85,
+    reason: hasQuestion
+      ? (context ? 'Interviewer scenario with terminal/embedded question' : 'Direct question')
+      : 'Declarative statement without interrogative question clause',
+    isFollowUp: category === 'FOLLOW_UP'
+  };
+}
+
 // -------------------------------------------------------------
 // 2. Utterance Classification Engine
 // -------------------------------------------------------------
@@ -299,10 +437,13 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
     };
   }
 
-  // 4. Topic Transitions (e.g. "Now let's discuss JavaScript", "Let's move on to indexing") (Reject immediately)
+  // Extract scenario context and questions across all sentences/clauses
+  const extracted = extractQuestionAndContext(clean);
+
+  // 4. Topic Transitions (e.g. "Now let's discuss JavaScript", "Let's move on to indexing")
   const isTransition = TOPIC_TRANSITION_REGEX.test(clean) || 
                        TOPIC_TRANSITION_PHRASES.some(phrase => lower.startsWith(phrase));
-  if (isTransition && !clean.endsWith('?')) {
+  if (isTransition && !clean.endsWith('?') && !extracted.hasQuestion) {
     return {
       isQuestion: false,
       intent: 'TOPIC_TRANSITION',
@@ -316,7 +457,7 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
 
   // 5. Incomplete Speech Fragments (Speaker paused mid-sentence on prepositions/conjunctions)
   const lastWord = words[words.length - 1].replace(/[.,!?;:]/g, '');
-  if (INCOMPLETE_TRAILING_WORDS.has(lastWord) && words.length < 15) {
+  if (INCOMPLETE_TRAILING_WORDS.has(lastWord) && (words.length < 15 || lastWord === 'between' || lastWord === 'vs' || lastWord === 'versus')) {
     return {
       isQuestion: false,
       intent: 'INCOMPLETE_FRAGMENT',
@@ -378,56 +519,38 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
       confidence: 0.95,
       reason: 'Contextual follow-up question',
       isFollowUp: true,
-      parentTopicHint: parent.question
+      parentTopicHint: parent.question,
+      extractedContext: extracted.context,
+      extractedQuestions: [clean]
     };
   }
 
-  // 8. Difference / Comparison Questions (verified to have comparison subjects)
-  const dualInfo = isDualConceptComparison(clean);
-  if ((DIFFERENCE_REGEX.test(clean) || dualInfo.isDual) && hasValidComparisonSubjects(clean)) {
+  // 8. If genuine question clause was found anywhere in utterance (terminal, embedded, or multi-question)
+  if (extracted.hasQuestion) {
+    const isFollowUp = FOLLOW_UP_REGEX.test(clean) || (
+      recentContext.length > 0 &&
+      (Date.now() - (recentContext[0].timestamp || 0)) <= 120000 &&
+      extracted.primaryQuestion.split(/\s+/).length <= 7 &&
+      /^(how would you handle|what about|how about|why\??|how so\??)\b/i.test(extracted.primaryQuestion)
+    );
+
     return {
       isQuestion: true,
       intent: 'GENUINE_QUESTION',
-      category: 'DIFFERENCE',
+      category: isFollowUp ? 'FOLLOW_UP' : extracted.category,
       cleanText: clean,
-      confidence: 0.95,
-      reason: dualInfo.isDual ? 'Dual-concept comparison question' : 'Comparative technical question with valid comparison subjects',
-      isFollowUp: false
+      confidence: extracted.confidence,
+      reason: extracted.reason,
+      isFollowUp,
+      parentTopicHint: recentContext[0]?.question,
+      extractedContext: extracted.context,
+      extractedQuestions: extracted.questions
     };
   }
 
-  // 9. How / Why Mechanism Questions
-  if (HOW_WHY_REGEX.test(clean)) {
-    return {
-      isQuestion: true,
-      intent: 'GENUINE_QUESTION',
-      category: 'HOW_WHY',
-      cleanText: clean,
-      confidence: 0.92,
-      reason: 'Mechanism or causal explanation question (How/Why)',
-      isFollowUp: false
-    };
-  }
-
-  // 10. Direct Questions (starts with interrogative or prompt keyword)
-  const hasTerminalQuestion = clean.endsWith('?');
-  if (QUESTION_STARTERS_REGEX.test(clean) || hasTerminalQuestion) {
-    // If it has terminal question mark or clear starter, it is a genuine question
-    const isDirect = words.length <= 15 && !lower.includes('compare') && !lower.includes('difference');
-    return {
-      isQuestion: true,
-      intent: 'GENUINE_QUESTION',
-      category: isDirect ? 'DIRECT' : 'GENERAL',
-      cleanText: clean,
-      confidence: 0.90,
-      reason: 'Interrogative starter or explicit question mark',
-      isFollowUp: false
-    };
-  }
-
-  // 11. Declarative Statements (e.g. "JavaScript is single threaded", "We use PostgreSQL at my company")
+  // 9. Declarative Statements without any question clause (e.g. "JavaScript is single threaded", "We use PostgreSQL at my company")
   const isDeclarative = /^(i\s+(am|have|think|worked|prefer)|we\s+(use|are|have|built)|this\s+is|it\s+is|that\s+is|my\s+experience)\b/i.test(clean);
-  if (isDeclarative && !hasTerminalQuestion) {
+  if (isDeclarative && !clean.endsWith('?')) {
     return {
       isQuestion: false,
       intent: 'STATEMENT',
@@ -439,11 +562,11 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
     };
   }
 
-  // 12. Technical Prompt heuristic: contains a known technical topic AND an action/query word
+  // 10. Technical Prompt heuristic: contains a known technical topic AND an action/query word
   const hasTechTopic = TECHNICAL_TOPICS.some(topic => lower.includes(topic));
   const hasActionQuery = /\b(use|work|workings|benefit|disadvantage|issue|error|pattern|structure|algorithm|lifecycle|scope|law|equation|principle|formula|method|test|analysis|calculation|design|trade-?off)\b/i.test(lower);
 
-  if (hasTechTopic && (hasActionQuery || hasTerminalQuestion) && words.length >= 3) {
+  if (hasTechTopic && (hasActionQuery || clean.endsWith('?')) && words.length >= 3) {
     return {
       isQuestion: true,
       intent: 'GENUINE_QUESTION',
@@ -451,7 +574,9 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
       cleanText: clean,
       confidence: 0.85,
       reason: 'Technical concept with query context',
-      isFollowUp: false
+      isFollowUp: false,
+      extractedContext: extracted.context,
+      extractedQuestions: [clean]
     };
   }
 
@@ -596,6 +721,11 @@ export function formatCompleteQuestion(text: string): string {
   const withoutTrailingPunct = clean.replace(/[?.,!;:]+$/, '').trim();
   const lower = withoutTrailingPunct.toLowerCase();
 
+  const extracted = extractQuestionAndContext(clean);
+  if (extracted.hasQuestion) {
+    return `${withoutTrailingPunct}?`;
+  }
+
   const isInterrogative = /^(what|why|how|when|where|which|who|whom|whose|explain|describe|define|implement|compare|differentiate|can you|could you|would you|is|are|does|do|have|should|will|calculate|compute|derive|evaluate|state|find|analyze|discuss|outline|summarize)\b/i.test(lower);
   const isComparison = /\b(difference\s+between|differences\s+between|compare|vs|versus|differ\s+from)\b/i.test(lower);
 
@@ -670,7 +800,13 @@ export function mergeSpeechFragments(existing: string, incoming: string): string
   if (isDiffStarter && !startsWithConnector) {
     merged = `${prev} between ${next}`;
   } else {
-    merged = `${prev} ${next}`;
+    // If existing ended with terminal punctuation (., !, ;), preserve it between distinct sentences
+    const hadTerminalSentencePunct = /[.!;]$/.test(existing.trim());
+    if (hadTerminalSentencePunct) {
+      merged = `${prev}. ${next}`;
+    } else {
+      merged = `${prev} ${next}`;
+    }
   }
 
   return formatCompleteQuestion(merged);
