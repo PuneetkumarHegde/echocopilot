@@ -254,6 +254,8 @@ const TECHNICAL_VOCABULARY: TechnicalTermDefinition[] = [
   { canonical: 'parallelism', domain: 'os', coOccursWith: ['concurrency', 'multicore', 'cpu'] },
   { canonical: 'recursion', domain: 'cs_general', coOccursWith: ['base case', 'call stack', 'algorithm'] },
   { canonical: 'nlp', domain: 'cs_general', aliases: ['n.l.p.'], coOccursWith: ['natural language processing', 'ai', 'text', 'machine learning', 'chatbots'] },
+  { canonical: 'stemming', domain: 'cs_general', aliases: ['stemmer', 'stemmers', 'stem'], coOccursWith: ['nlp', 'lemmatization', 'tokenization', 'text', 'natural language processing'] },
+  { canonical: 'lemmatization', domain: 'cs_general', aliases: ['lemmatizer', 'lemmatizers', 'lemmatize', 'lemma', 'lemmas'], coOccursWith: ['nlp', 'stemming', 'tokenization', 'pos', 'morphology', 'natural language processing'] },
   { canonical: 'normalization', domain: 'sql', aliases: ['normalize', 'normalized'], coOccursWith: ['database', 'dbms', 'sql', '1nf', '2nf', '3nf', 'redundancy', 'table'] },
   { canonical: 'mosfet', domain: 'electronics', aliases: ['mossfet'], coOccursWith: ['transistor', 'gate', 'drain', 'source'] },
   { canonical: 'diode', domain: 'electronics', coOccursWith: ['rectifier', 'anode', 'cathode', 'pn junction'] },
@@ -699,6 +701,30 @@ export function normalizeTechnicalTerms(
         domain: 'java'
       });
       normalized = normalized.replace(oopOverridePairRegex, (match, sep) => `method overriding ${sep} method overloading`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 1B: Context-Aware Speech-to-Text Misrecognition Recovery (Requirement 6)
+  // When active discussion is about "stemming", acoustic error "limitation" in a comparison position
+  // (e.g. "differs from limitation", "difference with limitation") is corrected to "lemmatization".
+  // -------------------------------------------------------------------------
+  const hasStemmingContext = historyStrings.some(h => /\b(stemming|stemmer|nlp)\b/i.test(h)) ||
+                             /\b(stemming|stemmer)\b/i.test(normalized);
+
+  if (hasStemmingContext) {
+    const limitationComparisonRegex = /\b(differ(?:s)?\s+from|different\s+(?:from|to|than)|difference\s+(?:from|with)|compare\s+(?:it|this)?\s*with|vs|versus)\s+(?:the\s+)?(limitations?)\b/gi;
+    if (limitationComparisonRegex.test(normalized)) {
+      normalized = normalized.replace(limitationComparisonRegex, (match, prefix, term) => {
+        corrections.push({
+          original: term,
+          corrected: 'lemmatization',
+          confidence: 0.98,
+          reason: 'Context-aware acoustic STT correction (limitation -> lemmatization in stemming comparison context)',
+          domain: 'cs_general'
+        });
+        return `${prefix} lemmatization`;
+      });
     }
   }
 

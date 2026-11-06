@@ -7,7 +7,7 @@
  */
 
 import { UserProfile, ProjectRecord, TargetJobDescription } from './profileTypes';
-import { ConversationTurnSummary } from './questionClassifier';
+import { ConversationTurnSummary, detectFollowUpReference, extractConceptFromQuestion } from './questionClassifier';
 
 export type QuestionIntent =
   | 'GENERAL_TECHNICAL'        // Technical concepts, mechanisms, principles (Java, Python, OS, etc.)
@@ -61,12 +61,57 @@ export function classifyQuestionIntent(
   const q = rawPrompt.trim();
   const qLower = q.toLowerCase();
 
-  // 1. Follow-up Check (Very short queries referring to immediate prior conversation)
+  // 1. Conversation-Aware Follow-up Check
+  if (contextHistory && contextHistory.length > 0) {
+    const followUp = detectFollowUpReference(q, contextHistory[0]);
+    if (followUp.isFollowUp) {
+      const isComparison = /\b(difference\s+between|compare\b|vs\b|versus\b|differentiate\s+between|distinguish\s+between|trade-?offs?\s+between|differ\s+from|differs\s+from|different\s+from|different\s+to|difference\s+with)\b/i.test(qLower);
+      if (isComparison) {
+        const concepts = extractComparisonConcepts(qLower, contextHistory);
+        const subject = concepts.conceptC
+          ? `${concepts.conceptA} vs ${concepts.conceptB} vs ${concepts.conceptC}`
+          : (concepts.conceptA && concepts.conceptB ? `${concepts.conceptA} vs ${concepts.conceptB}` : `${followUp.parentConcept} Comparison`);
+
+        return {
+          intent: 'COMPARISON',
+          confidence: 0.95,
+          reason: `Comparison follow-up anchored to "${followUp.parentConcept}": ${subject}`,
+          extractedConcepts: concepts,
+          isProjectAware: false,
+          isProfileAware: false,
+          targetSubject: subject
+        };
+      }
+
+      const isCode = /\b(write\s+code|implement|code\s+example|code\s+snippet|show\s+code)\b/i.test(qLower);
+      if (isCode) {
+        return {
+          intent: 'CODING_REQUEST',
+          confidence: 0.95,
+          reason: `Code implementation follow-up to "${followUp.parentConcept}"`,
+          isProjectAware: false,
+          isProfileAware: false,
+          targetSubject: `${followUp.parentConcept} Implementation`
+        };
+      }
+
+      return {
+        intent: 'FOLLOW_UP',
+        confidence: 0.95,
+        reason: followUp.reason,
+        isProjectAware: false,
+        isProfileAware: false,
+        targetSubject: followUp.resolvedPrompt || followUp.parentConcept
+      };
+    }
+  }
+
+  // 1B. Traditional Short Follow-up Patterns
   const isFollowUpPattern = /^(why|why\s+is\s+that|why\s+so|how\s+so|give\s+an\s+example|can\s+you\s+elaborate|what\s+about\s+(the\s+)?alternative|and\s+then|what\s+happens\s+next|show\s+an\s+example)[.?!]?$/i.test(qLower);
   if (isFollowUpPattern && contextHistory && contextHistory.length > 0) {
     const parent = contextHistory[0];
     const ageMs = Date.now() - parent.timestamp;
-    if (ageMs <= 120000) { // Within 2 minutes
+    if (ageMs <= 180000) {
       return {
         intent: 'FOLLOW_UP',
         confidence: 0.95,
@@ -81,10 +126,10 @@ export function classifyQuestionIntent(
   // 2. Comparison / Difference Question Check
   // Matches "difference between X and Y", "compare X and Y", "X vs Y", "X versus Y", "differentiate X and Y", "X differ from Y", etc.
   const isComparisonQuery = 
-    /\b(difference\s+between|compare\b|vs\b|versus\b|differentiate\s+between|distinguish\s+between|trade-?offs?\s+between|differ\s+from|differs\s+from|contrast\s+.*\s+(with|and)|which\s+is\s+better|which\s+one\s+to\s+use)\b/i.test(qLower);
+    /\b(difference\s+between|compare\b|vs\b|versus\b|differentiate\s+between|distinguish\s+between|trade-?offs?\s+between|differ\s+from|differs\s+from|different\s+from|contrast\s+.*\s+(with|and)|which\s+is\s+better|which\s+one\s+to\s+use)\b/i.test(qLower);
 
   if (isComparisonQuery) {
-    const concepts = extractComparisonConcepts(qLower);
+    const concepts = extractComparisonConcepts(qLower, contextHistory);
     const subject = concepts.conceptC
       ? `${concepts.conceptA} vs ${concepts.conceptB} vs ${concepts.conceptC}`
       : (concepts.conceptA && concepts.conceptB ? `${concepts.conceptA} vs ${concepts.conceptB}` : 'Comparison');
@@ -264,8 +309,35 @@ export function classifyQuestionIntent(
 // 2. Helper: Extract comparison concepts from query
 // -----------------------------------------------------------------
 
-export function extractComparisonConcepts(query: string): { conceptA?: string; conceptB?: string; conceptC?: string } {
+export function extractComparisonConcepts(
+  query: string,
+  contextHistory?: ConversationTurnSummary[]
+): { conceptA?: string; conceptB?: string; conceptC?: string } {
   const q = query.toLowerCase();
+
+  const resolveAnaphoraConcept = (name: string): string => {
+    const cleaned = cleanConceptName(name);
+    if (!cleaned || /^(it|its|this|that|the\s+former|the\s+latter)$/i.test(cleaned)) {
+      if (contextHistory && contextHistory.length > 0) {
+        return contextHistory[0].concept || extractConceptFromQuestion(contextHistory[0].question) || cleaned;
+      }
+    }
+    return cleaned;
+  };
+
+  const normalizeContextualPair = (cA: string, cB: string): { conceptA: string; conceptB: string } => {
+    let a = resolveAnaphoraConcept(cA);
+    let b = resolveAnaphoraConcept(cB);
+
+    // Phonetic / speech STT recovery: if discussing stemming and comparing with "limitation", it is lemmatization
+    if (a.toLowerCase().includes('stem') && b.toLowerCase() === 'limitation') {
+      b = 'lemmatization';
+    } else if (b.toLowerCase().includes('stem') && a.toLowerCase() === 'limitation') {
+      a = 'lemmatization';
+    }
+
+    return { conceptA: a, conceptB: b };
+  };
 
   // Pattern 0: 3-way comparisons (e.g. "DELETE vs TRUNCATE vs DROP" or "difference between DELETE, TRUNCATE, and DROP")
   const threeWayVs = q.match(/(.+?)\s+(?:vs\.?|versus)\s+(.+?)\s+(?:vs\.?|versus)\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
@@ -289,54 +361,60 @@ export function extractComparisonConcepts(query: string): { conceptA?: string; c
   // Pattern 1: "difference between X and Y"
   const diffMatch = q.match(/difference\s+between\s+(.+?)\s+and\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
   if (diffMatch && diffMatch[1] && diffMatch[2]) {
+    const pair = normalizeContextualPair(diffMatch[1], diffMatch[2]);
     return {
-      conceptA: cleanConceptName(diffMatch[1]),
-      conceptB: cleanConceptName(diffMatch[2])
+      conceptA: pair.conceptA,
+      conceptB: pair.conceptB
     };
   }
 
   // Pattern 2: "compare X and/with/to Y"
   const compMatch = q.match(/compare\s+(.+?)\s+(?:and|with|to)\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
   if (compMatch && compMatch[1] && compMatch[2]) {
+    const pair = normalizeContextualPair(compMatch[1], compMatch[2]);
     return {
-      conceptA: cleanConceptName(compMatch[1]),
-      conceptB: cleanConceptName(compMatch[2])
+      conceptA: pair.conceptA,
+      conceptB: pair.conceptB
     };
   }
 
   // Pattern 3: "X vs Y" or "X versus Y"
   const vsMatch = q.match(/(.+?)\s+(?:vs\.?|versus)\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
   if (vsMatch && vsMatch[1] && vsMatch[2]) {
+    const pair = normalizeContextualPair(vsMatch[1], vsMatch[2]);
     return {
-      conceptA: cleanConceptName(vsMatch[1]),
-      conceptB: cleanConceptName(vsMatch[2])
+      conceptA: pair.conceptA,
+      conceptB: pair.conceptB
     };
   }
 
   // Pattern 4: "differentiate between X and Y"
   const diffBetMatch = q.match(/differentiate\s+between\s+(.+?)\s+and\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
   if (diffBetMatch && diffBetMatch[1] && diffBetMatch[2]) {
+    const pair = normalizeContextualPair(diffBetMatch[1], diffBetMatch[2]);
     return {
-      conceptA: cleanConceptName(diffBetMatch[1]),
-      conceptB: cleanConceptName(diffBetMatch[2])
+      conceptA: pair.conceptA,
+      conceptB: pair.conceptB
     };
   }
 
-  // Pattern 5: "how does X differ from Y"
-  const differMatch = q.match(/(?:how\s+does\s+)?(.+?)\s+differ(?:s)?\s+from\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
+  // Pattern 5: "how does X differ from Y", "how is X different from Y", "X differs from Y", "how it differs from Y"
+  const differMatch = q.match(/(?:how\s+(?:does|is)\s+)?(.+?)\s+(?:differ(?:s)?\s+from|different\s+(?:from|to|than)|difference\s+(?:from|with))\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
   if (differMatch && differMatch[1] && differMatch[2]) {
+    const pair = normalizeContextualPair(differMatch[1], differMatch[2]);
     return {
-      conceptA: cleanConceptName(differMatch[1]),
-      conceptB: cleanConceptName(differMatch[2])
+      conceptA: pair.conceptA,
+      conceptB: pair.conceptB
     };
   }
 
   // Pattern 6: "contrast X with Y"
   const contrastMatch = q.match(/contrast\s+(.+?)\s+(?:with|and)\s+(.+?)(?:\s+in\s+.*|\?|$)/i);
   if (contrastMatch && contrastMatch[1] && contrastMatch[2]) {
+    const pair = normalizeContextualPair(contrastMatch[1], contrastMatch[2]);
     return {
-      conceptA: cleanConceptName(contrastMatch[1]),
-      conceptB: cleanConceptName(contrastMatch[2])
+      conceptA: pair.conceptA,
+      conceptB: pair.conceptB
     };
   }
 
@@ -347,6 +425,7 @@ function cleanConceptName(concept: string): string {
   return concept
     .replace(/^(an?|the)\s+/i, '')
     .replace(/^(what\s+is\s+(the\s+)?difference\s+between\s+)/i, '')
+    .replace(/^(could\s+you\s+(also\s+)?explain\s+(?:its\s+)?limitations\s+and\s+how\s+|how\s+does\s+|how\s+is\s+|how\s+)/i, '')
     .replace(/\s+(?:in|on|using|with)\s+(?:github|gitlab|git|java|python|javascript|c\+\+|sql|postgres|database|os)$/i, '')
     .replace(/[?.!,;:]+$/g, '')
     .trim();

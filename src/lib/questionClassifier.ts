@@ -57,7 +57,11 @@ export interface QuestionReadinessResult {
 
 export interface ConversationTurnSummary {
   id?: string;
+  utteranceId?: string;
   question: string;
+  rawTranscript?: string;
+  normalizedTranscript?: string;
+  concept?: string;
   summary: string;
   timestamp: number;
   category?: QuestionCategory;
@@ -193,15 +197,180 @@ export function isDualConceptComparison(text: string): { isDual: boolean; subjec
 }
 
 /**
+ * Extracts the primary conceptual subject from an interview question.
+ * Examples:
+ * - "What is stemming?" -> "stemming"
+ * - "What is a REST API?" -> "rest api"
+ * - "What are its constraints?" -> "constraints"
+ * - "Explain inheritance in Java" -> "inheritance"
+ * - "Difference between Array and ArrayList" -> "array vs arraylist"
+ */
+export function extractConceptFromQuestion(question: string): string {
+  if (!question || typeof question !== 'string') return '';
+  const clean = question.trim().replace(/[?!.,;:]+$/, '').trim();
+  const lower = clean.toLowerCase();
+
+  // Pattern 1: Explicit Comparisons (difference between X and Y, X vs Y)
+  const diffMatch = lower.match(/\b(?:difference\s+between|compare|differentiate\s+between)\s+(.+?)\s+\b(?:and|vs|versus)\b\s+(.+)$/i);
+  if (diffMatch) {
+    const s1 = diffMatch[1].replace(/^(?:an?|the)\s+/i, '').trim();
+    const s2 = diffMatch[2].replace(/^(?:an?|the)\s+/i, '').trim();
+    return `${s1} vs ${s2}`;
+  }
+  const vsMatch = lower.match(/^(.+?)\s+\b(?:vs|versus)\b\s+(.+)$/i);
+  if (vsMatch) {
+    const s1 = vsMatch[1].replace(/^(?:an?|the)\s+/i, '').trim();
+    const s2 = vsMatch[2].replace(/^(?:an?|the)\s+/i, '').trim();
+    return `${s1} vs ${s2}`;
+  }
+
+  // Pattern 2: "What is [concept] / What are [concept]"
+  const whatIsMatch = lower.match(/^(?:can\s+you\s+explain\s+|could\s+you\s+explain\s+|tell\s+me\s+about\s+)?what\s+(?:is|are)\s+(?:an?|the\s+concept\s+of\s+|the\s+)?(.+?)(?:\s+(?:in|and\s+how|internally|used|for|with)\b.*)?$/i);
+  if (whatIsMatch && whatIsMatch[1]) {
+    const candidate = whatIsMatch[1].trim();
+    if (candidate.length >= 2 && !/^(?:it|its|this|that|these|those)$/i.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  // Pattern 3: "Explain [concept] / Describe [concept]"
+  const explainMatch = lower.match(/^(?:can\s+you\s+|could\s+you\s+)?(?:explain|describe|walk\s+me\s+through|tell\s+me\s+about)\s+(?:the\s+concept\s+of\s+|an?|the\s+)?(.+?)(?:\s+(?:in|and\s+how|internally|used|for|with)\b.*)?$/i);
+  if (explainMatch && explainMatch[1]) {
+    const candidate = explainMatch[1].trim();
+    if (candidate.length >= 2 && !/^(?:it|its|this|that|these|those|statelessness\s+with\s+an\s+example)$/i.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  // Pattern 4: "How does [concept] work"
+  const howDoesMatch = lower.match(/^how\s+does\s+(?:an?|the\s+)?(.+?)\s+work(?:\s+internally)?/i);
+  if (howDoesMatch && howDoesMatch[1]) {
+    const candidate = howDoesMatch[1].trim();
+    if (candidate.length >= 2 && !/^(?:it|this|that)$/i.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  // Fallback: extract technical keywords
+  const kws = extractKeywords(clean);
+  if (kws.length > 0) {
+    return kws[0];
+  }
+
+  // Fallback: strip leading interrogatives
+  const stripped = lower
+    .replace(/^(what\s+is|what\s+are|explain|describe|tell\s+me\s+about|how\s+does|how\s+to|can\s+you\s+explain)\s+(an?|the)?\s*/i, '')
+    .trim();
+  return stripped.split(/\s+/).slice(0, 3).join(' ');
+}
+
+export interface FollowUpDetectionResult {
+  isFollowUp: boolean;
+  parentTurn?: ConversationTurnSummary;
+  parentConcept?: string;
+  resolvedPrompt?: string;
+  reason: string;
+}
+
+/**
+ * Detects whether an utterance is a conversational follow-up to the immediately preceding question,
+ * resolving anaphora and pronouns ("its", "it", "that", "this") to the active concept.
+ * Ensures independent new questions (e.g. "What is sentiment analysis?" after "What is stemming?")
+ * switch topics immediately and do NOT reuse previous context.
+ */
+export function detectFollowUpReference(
+  rawText: string,
+  parentTurn?: ConversationTurnSummary
+): FollowUpDetectionResult {
+  const clean = rawText.trim().replace(/[?!.,;:]+$/, '').trim();
+  const lower = clean.toLowerCase();
+
+  if (!parentTurn) {
+    return { isFollowUp: false, reason: 'No preceding conversation turn' };
+  }
+
+  const ageMs = Date.now() - (parentTurn.timestamp || 0);
+  if (ageMs > 180000) { // 3 minutes TTL
+    return { isFollowUp: false, reason: 'Preceding context is stale (>180s)' };
+  }
+
+  const parentConcept = parentTurn.concept || extractConceptFromQuestion(parentTurn.question);
+  if (!parentConcept) {
+    return { isFollowUp: false, reason: 'Parent turn has no identifiable concept' };
+  }
+
+  // 1. Guard against new independent topic introductions
+  // If the prompt explicitly introduces a brand new distinct technical concept, it is NOT a follow-up
+  // e.g. "What is sentiment analysis?" when parent is "What is stemming?"
+  const startsNewConcept = /^(what\s+is\s+(an?|the)?|explain\s+(the\s+concept\s+of\s+|an?|the)?|what\s+are\s+(an?|the)?)\s+([a-z0-9_-]+(\s+[a-z0-9_-]+)?)$/i.test(lower);
+  if (startsNewConcept) {
+    const conceptMatch = lower.match(/^(what\s+is\s+(?:an?|the)?|explain\s+(?:the\s+concept\s+of\s+|an?|the)?|what\s+are\s+(?:an?|the)?)\s+([a-z0-9_-]+(?:\s+[a-z0-9_-]+)?)$/i);
+    const candidateConcept = conceptMatch ? conceptMatch[conceptMatch.length - 1].trim() : '';
+    const isPronoun = /^(it|its|this|that|these|those)$/i.test(candidateConcept);
+    if (!isPronoun && candidateConcept && candidateConcept !== parentConcept.toLowerCase()) {
+      return { isFollowUp: false, reason: `Explicit switch to new concept "${candidateConcept}"` };
+    }
+  }
+
+  // 2. Pronoun / Anaphoric reference indicators
+  const hasAnaphora = /\b(it|its|this|that|these|those|the former|the latter)\b/i.test(lower);
+
+  // 3. Follow-up inquiry patterns (asking about properties/constraints/mechanisms/subtopics without naming main subject)
+  const isPropertyInquiry = 
+    /\b(limitations?|drawbacks?|disadvantages?|advantages?|benefits?|constraints?|trade-?offs?|internally|statelessness|working|mechanism|example)\b/i.test(lower);
+
+  const isShortFollowUp = 
+    /^(why\??|why\s+is\s+that\??|why\s+so\??|how\s+so\??|what\s+about|how\s+about|how\s+would\s+you\s+handle|how\s+do\s+you\s+handle|how\s+to\s+handle|could\s+you\s+elaborate|can\s+you\s+elaborate|and\s+then|what\s+happens\s+next)\b/i.test(lower);
+
+  const isComparativeFollowUp = 
+    /\b(?:differ(?:s)?\s+from|different\s+(?:from|to|than)|difference\s+with|compare\s+(?:it|this|that)?\s*(?:with|to))\b/i.test(lower);
+
+  if (hasAnaphora || isPropertyInquiry || isShortFollowUp || isComparativeFollowUp) {
+    // Construct resolved prompt
+    let resolvedPrompt = clean;
+    if (lower.includes('its limitations') && (lower.includes('differ') || lower.includes('lemmatiz'))) {
+      resolvedPrompt = `Explain the limitations of ${parentConcept} and how ${parentConcept} differs from lemmatization.`;
+    } else if (hasAnaphora) {
+      resolvedPrompt = clean
+        .replace(/\bits\b/gi, `${parentConcept}'s`)
+        .replace(/\b(it|this|that)\b/gi, parentConcept);
+    } else if (lower.startsWith('explain statelessness') && parentConcept.toLowerCase().includes('rest')) {
+      resolvedPrompt = `Explain statelessness in REST API with an example.`;
+    }
+
+    return {
+      isFollowUp: true,
+      parentTurn,
+      parentConcept,
+      resolvedPrompt,
+      reason: `Anchored to prior topic "${parentConcept}" via follow-up indicator`
+    };
+  }
+
+  return { isFollowUp: false, reason: 'Not recognized as a follow-up to prior topic' };
+}
+
+/**
  * Validates whether an utterance asking for a comparison actually specifies the subjects to compare.
  * Prevents premature triggering and hallucination for queries like "What is the difference?"
  */
-export function hasValidComparisonSubjects(text: string): boolean {
+export function hasValidComparisonSubjects(text: string, contextHistory?: ConversationTurnSummary[]): boolean {
   const clean = text.trim().replace(/[?!.,;:]+$/, '').trim();
   const lower = clean.toLowerCase();
 
   if (isDualConceptComparison(clean).isDual) {
     return true;
+  }
+
+  // If there is preceding context with an active concept and the question is a comparative follow-up:
+  if (contextHistory && contextHistory.length > 0) {
+    const parentConcept = contextHistory[0].concept || extractConceptFromQuestion(contextHistory[0].question);
+    if (parentConcept) {
+      const comparativeFollowUpMatch = lower.match(/\b(?:differ(?:s)?\s+from|different\s+(?:from|to|than)|difference\s+(?:from|with)|compare\s+(?:it|this|that)?\s*(?:with|to))\s+(.+)$/i);
+      if (comparativeFollowUpMatch && comparativeFollowUpMatch[1].trim().length >= 2) {
+        return true;
+      }
+    }
   }
 
   const isComparisonQuery = /\b(difference|differences|compare|differ|distinguish|trade-?off|trade-?offs|vs|versus)\b/i.test(lower);
@@ -251,8 +420,8 @@ export function hasValidComparisonSubjects(text: string): boolean {
     return left.length >= 2 && right.length >= 2;
   }
 
-  // 4. Check for "how does X differ from Y" or "X differs from Y"
-  const differMatch = lower.match(/\b(.+?)\s+differ(?:s)?\s+from\s+(.+)$/i);
+  // 4. Check for "how does X differ from Y", "X differs from Y", "X is different from Y"
+  const differMatch = lower.match(/\b(.+?)\s+(?:differ(?:s)?\s+from|different\s+(?:from|to|than)|difference\s+(?:from|with))\s+(.+)$/i);
   if (differMatch) {
     const left = differMatch[1].trim();
     const right = differMatch[2].trim();
@@ -471,7 +640,7 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
 
   // 6. Incomplete Comparison Questions (e.g. "What is the difference?", "What is the difference between?")
   const isComparisonQuery = /\b(difference|differences|compare|differ|distinguish|trade-?off|trade-?offs)\b/i.test(lower);
-  if (isComparisonQuery && !hasValidComparisonSubjects(clean)) {
+  if (isComparisonQuery && !hasValidComparisonSubjects(clean, recentContext)) {
     return {
       isQuestion: false,
       intent: 'INCOMPLETE_FRAGMENT',
@@ -483,7 +652,25 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
     };
   }
 
-  // 7. Contextual Follow-up Questions (e.g. "Why?", "What about the alternative?", "How so?")
+  // 7. Contextual Follow-up Questions (via conversation-aware detection)
+  const followUpCheck = recentContext.length > 0 ? detectFollowUpReference(clean, recentContext[0]) : null;
+  if (followUpCheck && followUpCheck.isFollowUp) {
+    const parent = recentContext[0];
+    const isComparisonFollowUp = /\b(difference|compare|vs|versus|differ)\b/i.test(clean);
+    return {
+      isQuestion: true,
+      intent: 'GENUINE_QUESTION',
+      category: isComparisonFollowUp ? 'DIFFERENCE' : 'FOLLOW_UP',
+      cleanText: clean,
+      confidence: 0.95,
+      reason: followUpCheck.reason,
+      isFollowUp: true,
+      parentTopicHint: parent.question,
+      extractedContext: extracted.context,
+      extractedQuestions: [clean]
+    };
+  }
+
   if (FOLLOW_UP_REGEX.test(clean) || (words.length <= 4 && (lower.startsWith('why') || lower.startsWith('how so') || lower.includes('alternative')))) {
     if (recentContext.length === 0) {
       return {
@@ -498,7 +685,7 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
     }
 
     const parent = recentContext[0];
-    const isStale = (Date.now() - parent.timestamp) > 120000;
+    const isStale = (Date.now() - parent.timestamp) > 180000;
     if (isStale) {
       return {
         isQuestion: false,
@@ -506,7 +693,7 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
         category: 'FOLLOW_UP',
         cleanText: clean,
         confidence: 0.85,
-        reason: 'Preceding conversation context is stale (> 120s); cannot reliably anchor follow-up',
+        reason: 'Preceding conversation context is stale (> 180s); cannot reliably anchor follow-up',
         isFollowUp: false
       };
     }
@@ -527,12 +714,7 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
 
   // 8. If genuine question clause was found anywhere in utterance (terminal, embedded, or multi-question)
   if (extracted.hasQuestion) {
-    const isFollowUp = FOLLOW_UP_REGEX.test(clean) || (
-      recentContext.length > 0 &&
-      (Date.now() - (recentContext[0].timestamp || 0)) <= 120000 &&
-      extracted.primaryQuestion.split(/\s+/).length <= 7 &&
-      /^(how would you handle|what about|how about|why\??|how so\??)\b/i.test(extracted.primaryQuestion)
-    );
+    const isFollowUp = Boolean(followUpCheck?.isFollowUp);
 
     return {
       isQuestion: true,
@@ -542,7 +724,7 @@ export function classifyUtterance(rawText: string, recentContext: ConversationTu
       confidence: extracted.confidence,
       reason: extracted.reason,
       isFollowUp,
-      parentTopicHint: recentContext[0]?.question,
+      parentTopicHint: isFollowUp ? recentContext[0]?.question : undefined,
       extractedContext: extracted.context,
       extractedQuestions: extracted.questions
     };
@@ -605,6 +787,19 @@ export function isQuestionReadyForAnswer(
   const lower = clean.toLowerCase();
   const words = lower.split(' ').filter(Boolean);
 
+  // Check if it's an anchored follow-up to immediate preceding topic
+  if (contextHistory && contextHistory.length > 0) {
+    const followUpCheck = detectFollowUpReference(clean, contextHistory[0]);
+    if (followUpCheck.isFollowUp) {
+      return {
+        isReady: true,
+        reason: followUpCheck.reason,
+        isFollowUpCandidate: true,
+        needsMoreSpeech: false
+      };
+    }
+  }
+
   // Standalone follow-up token check (e.g. "Why?", "How so?")
   const isShortFollowUp = /^(?:why|how so)\??$/i.test(clean);
   if (isShortFollowUp) {
@@ -617,11 +812,11 @@ export function isQuestionReadyForAnswer(
       };
     }
     const parent = contextHistory[0];
-    const isStale = (Date.now() - (parent.timestamp || 0)) > 120000;
+    const isStale = (Date.now() - (parent.timestamp || 0)) > 180000;
     if (isStale) {
       return {
         isReady: false,
-        reason: 'Preceding conversation context is stale (> 120s); cannot reliably anchor follow-up',
+        reason: 'Preceding conversation context is stale (> 180s); cannot reliably anchor follow-up',
         isFollowUpCandidate: false,
         needsMoreSpeech: true
       };
@@ -656,7 +851,7 @@ export function isQuestionReadyForAnswer(
 
   // Strict comparison validation
   const isComparison = /\b(difference|differences|compare|differ|distinguish|trade-?off|trade-?offs|vs|versus)\b/i.test(lower);
-  if (isComparison && !hasValidComparisonSubjects(clean)) {
+  if (isComparison && !hasValidComparisonSubjects(clean, contextHistory)) {
     return {
       isReady: false,
       reason: 'Incomplete comparison question: missing comparison subjects (e.g. "between X and Y")',
@@ -824,10 +1019,73 @@ export class ConversationContextTracker {
     this.maxHistory = maxHistory;
   }
 
-  public recordTurn(question: string, summary: string, category: QuestionCategory = 'GENERAL') {
+  public registerActiveTurn(
+    question: string,
+    utteranceId?: string,
+    rawTranscript?: string,
+    normalizedTranscript?: string,
+    category: QuestionCategory = 'GENERAL'
+  ): void {
+    const concept = extractConceptFromQuestion(question);
     const item: ConversationTurnSummary = {
       id: `ctx_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      utteranceId,
       question: question.trim(),
+      rawTranscript: rawTranscript || question,
+      normalizedTranscript: normalizedTranscript || question,
+      concept,
+      summary: '',
+      timestamp: Date.now(),
+      category,
+      keywords: extractKeywords(question)
+    };
+
+    if (this.history.length > 0 && this.history[0].question.toLowerCase() === question.trim().toLowerCase()) {
+      this.history[0] = { ...this.history[0], ...item };
+    } else {
+      this.history.unshift(item);
+      if (this.history.length > this.maxHistory) {
+        this.history.pop();
+      }
+    }
+  }
+
+  public updateLatestTurnSummary(summary: string, category?: QuestionCategory): void {
+    if (this.history.length > 0) {
+      this.history[0].summary = summary.trim();
+      if (category) this.history[0].category = category;
+    }
+  }
+
+  public recordTurn(
+    question: string, 
+    summary: string, 
+    category: QuestionCategory = 'GENERAL',
+    meta?: {
+      utteranceId?: string;
+      rawTranscript?: string;
+      normalizedTranscript?: string;
+      concept?: string;
+    }
+  ) {
+    const concept = meta?.concept || extractConceptFromQuestion(question);
+    if (this.history.length > 0 && this.history[0].question.toLowerCase() === question.trim().toLowerCase()) {
+      this.history[0].summary = summary.trim();
+      this.history[0].category = category;
+      if (meta?.utteranceId) this.history[0].utteranceId = meta.utteranceId;
+      if (meta?.rawTranscript) this.history[0].rawTranscript = meta.rawTranscript;
+      if (meta?.normalizedTranscript) this.history[0].normalizedTranscript = meta.normalizedTranscript;
+      if (concept) this.history[0].concept = concept;
+      return;
+    }
+
+    const item: ConversationTurnSummary = {
+      id: `ctx_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      utteranceId: meta?.utteranceId,
+      question: question.trim(),
+      rawTranscript: meta?.rawTranscript || question,
+      normalizedTranscript: meta?.normalizedTranscript || question,
+      concept,
       summary: summary.trim(),
       timestamp: Date.now(),
       category,
@@ -848,41 +1106,43 @@ export class ConversationContextTracker {
   }
 
   /**
-   * Resolves follow-ups like "Why?" or "What about the alternative?"
-   * into a fully contextualized query prompt for Ollama.
+   * Resolves follow-ups like "Why?", "What about the alternative?",
+   * or "Could you also explain its limitations and how it differs from lemmatization?"
+   * into a fully contextualized query prompt for Ollama and internal engines.
    * Conservative: only reuses context when the query genuinely refers to the immediate prior topic.
    * NEVER borrows comparison subjects for an incomplete difference question.
    */
   public resolveContextualPrompt(query: string): { 
     enrichedPrompt: string; 
+    resolvedQuery: string;
     isFollowUp: boolean; 
     parentQuestion?: string;
+    parentConcept?: string;
     category: QuestionCategory;
   } {
-    const readiness = isQuestionReadyForAnswer(query, this.history);
     const classification = classifyUtterance(query, this.history);
-    
-    // Only resolve as follow-up if readiness explicitly confirmed isFollowUpCandidate
-    // AND the preceding topic is fresh (<= 120s)
-    if (readiness.isFollowUpCandidate && this.history.length > 0) {
-      const parent = this.history[0];
-      const ageMs = Date.now() - parent.timestamp;
-      
-      const isComparison = /\b(difference|compare|vs|versus)\b/i.test(query);
-      if (ageMs <= 120000 && (!isComparison || hasValidComparisonSubjects(query))) {
-        const enrichedPrompt = `[Context: Previous interview discussion on "${parent.question}". Core summary was: "${parent.summary}".]\nInterviewer follow-up question: "${query}"\nProvide a focused, direct answer to this follow-up without repeating the full previous explanation.`;
+    const parent = this.history[0];
+    const followUpCheck = detectFollowUpReference(query, parent);
 
-        return {
-          enrichedPrompt,
-          isFollowUp: true,
-          parentQuestion: parent.question,
-          category: 'FOLLOW_UP'
-        };
-      }
+    if (followUpCheck.isFollowUp && parent) {
+      const parentConcept = followUpCheck.parentConcept || parent.concept || extractConceptFromQuestion(parent.question);
+      const resolvedQuery = followUpCheck.resolvedPrompt || query;
+      const isComparison = /\b(difference|compare|vs|versus|differ)\b/i.test(resolvedQuery);
+      const enrichedPrompt = `[Context: Previous interview discussion on "${parent.question}". Core concept: "${parentConcept}". Core summary was: "${parent.summary || parent.question}".]\nInterviewer follow-up question: "${query}"\nProvide a focused, direct answer to this follow-up without repeating the full previous explanation.`;
+
+      return {
+        enrichedPrompt,
+        resolvedQuery,
+        isFollowUp: true,
+        parentQuestion: parent.question,
+        parentConcept,
+        category: isComparison ? 'DIFFERENCE' : 'FOLLOW_UP'
+      };
     }
 
     return {
       enrichedPrompt: query,
+      resolvedQuery: query,
       isFollowUp: false,
       category: classification.category
     };

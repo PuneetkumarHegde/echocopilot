@@ -1314,16 +1314,22 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     if (triggerAllowed && isNew) {
       turn.triggeredAnswer = true;
       setPipelineStatus('question_detected');
-      handleGenerateAnswer(text, classification.category);
+      handleGenerateAnswer(text, classification.category, turn.id);
     }
   };
 
   // -------------------------------------------------------------
   // 9. AI Copilot Answer Generator with SSE Streaming & New Question Cancellation
   // -------------------------------------------------------------
-  const handleGenerateAnswer = async (promptText?: string, explicitCategory?: QuestionCategory) => {
+  const handleGenerateAnswer = async (
+    promptText?: string, 
+    explicitCategory?: QuestionCategory,
+    utteranceId?: string
+  ) => {
     const rawQuery = (promptText || manualInput).trim();
     if (!rawQuery) return;
+
+    const currentUtteranceId = utteranceId || ('utt_' + Date.now());
 
     // Gatekeeper: block incomplete questions from Ollama generation (Requirement 3)
     const history = contextTrackerRef.current.getRecentHistory();
@@ -1337,33 +1343,29 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
     // Monotonically increasing request ID to track and reject stale responses (Requirement 5)
     const currentRequestId = ++activeRequestIdRef.current;
 
-    // Requirement 5: Recognize when interviewer moves to a new independent question.
-    // Cancel in-flight generation, clear outdated active answer, and prioritize new question.
+    // Requirement 5: Always cancel any in-flight answer generation immediately when a new question arrives
     if (inFlightQueryRef.current && activeAbortControllerRef.current) {
       if (inFlightQueryRef.current.toLowerCase() === rawQuery.toLowerCase()) {
         console.log(`[CopilotModule] Query already actively generating for "${rawQuery}". Skipping duplicate fetch.`);
         return;
       }
 
-      const { shouldCancel, reason } = isNewIndependentQuestion(rawQuery, inFlightQueryRef.current);
-      if (shouldCancel) {
-        console.log(`[CopilotModule] Canceling in-flight answer for "${inFlightQueryRef.current}": ${reason}. Starting new question: "${rawQuery}"`);
-        try {
-          activeAbortControllerRef.current.abort();
-        } catch {}
-        activeAbortControllerRef.current = null;
-        setStreamingAnswerText('');
-        setFirstTokenLatency(null);
+      console.log(`[CopilotModule] Canceling in-flight answer for "${inFlightQueryRef.current}" (request #${currentRequestId - 1}). Superseded by new question: "${rawQuery}" (request #${currentRequestId})`);
+      try {
+        activeAbortControllerRef.current.abort();
+      } catch {}
+      activeAbortControllerRef.current = null;
+      setStreamingAnswerText('');
+      setFirstTokenLatency(null);
 
-        // Broadcast abort event so overlay clears immediately
-        try {
-          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-            const bc = new BroadcastChannel('echocopilot_channel');
-            bc.postMessage({ type: 'STREAM_ABORT', requestId: currentRequestId, supersededBy: rawQuery });
-            bc.close();
-          }
-        } catch {}
-      }
+      // Broadcast abort event so overlay clears immediately
+      try {
+        if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+          const bc = new BroadcastChannel('echocopilot_channel');
+          bc.postMessage({ type: 'STREAM_ABORT', requestId: currentRequestId, supersededBy: rawQuery });
+          bc.close();
+        }
+      } catch {}
     }
 
     // If manual query (not from speech committer), add turn to transcript feed
@@ -1374,7 +1376,7 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           return prev;
         }
         const manualTurn: TranscriptTurn = {
-          id: 'turn_manual_' + Date.now(),
+          id: currentUtteranceId,
           speaker: 'interviewer',
           source: 'manual',
           text: rawQuery,
@@ -1386,8 +1388,12 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
       });
     }
 
-    // Requirement 4: Resolve context & follow-ups ("Why?", "What about the alternative?")
-    const { enrichedPrompt, isFollowUp, category } = 
+    // Register active turn in context tracker immediately so that in-flight context is available
+    // for subsequent follow-up speech before generation finishes
+    contextTrackerRef.current.registerActiveTurn(rawQuery, currentUtteranceId, rawQuery, rawQuery);
+
+    // Requirement 4: Resolve context & follow-ups ("Why?", "What about the alternative?", "Could you also explain its limitations and how it differs from lemmatization?")
+    const { enrichedPrompt, isFollowUp, category, parentConcept } = 
       contextTrackerRef.current.resolveContextualPrompt(rawQuery);
 
     const finalCategory = explicitCategory || category;
@@ -1458,7 +1464,17 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
           ollamaUrl,
           stream: true,
           category: finalCategory,
-          contextHistory: history.map(h => ({ question: h.question, summary: h.summary })),
+          contextHistory: history.map(h => ({ 
+            id: h.id,
+            utteranceId: h.utteranceId,
+            question: h.question, 
+            summary: h.summary,
+            concept: h.concept,
+            timestamp: h.timestamp,
+            category: h.category
+          })),
+          requestId: currentRequestId,
+          utteranceId: currentUtteranceId,
           profileContext: careerProfile,
           projectContext: activeProjects,
           temperature,
@@ -1613,7 +1629,10 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         if (finalAnswerReceived && activeRequestIdRef.current === currentRequestId) {
           const cleanAnswer = { ...finalAnswerReceived, question: rawQuery };
           setAnswers(prev => [cleanAnswer, ...prev]);
-          contextTrackerRef.current.recordTurn(rawQuery, cleanAnswer.summary, finalCategory);
+          contextTrackerRef.current.recordTurn(rawQuery, cleanAnswer.summary, finalCategory, {
+            utteranceId: currentUtteranceId,
+            concept: parentConcept
+          });
           setPipelineStatus('answer_ready');
 
           try {
@@ -1634,7 +1653,10 @@ export const CopilotModule: React.FC<CopilotModuleProps> = ({
         if (data.answer && activeRequestIdRef.current === currentRequestId) {
           const cleanAnswer = { ...data.answer, question: rawQuery };
           setAnswers(prev => [cleanAnswer, ...prev]);
-          contextTrackerRef.current.recordTurn(rawQuery, cleanAnswer.summary, finalCategory);
+          contextTrackerRef.current.recordTurn(rawQuery, cleanAnswer.summary, finalCategory, {
+            utteranceId: currentUtteranceId,
+            concept: parentConcept
+          });
           setPipelineStatus('answer_ready');
           if (data.setupNotice) setSetupNotice(data.setupNotice);
 

@@ -1282,6 +1282,337 @@ print(preprocess_text(sample_corpus))
   }
 
   // -----------------------------------------------------------------
+  // Stemming in NLP (Single Concept & Limitations)
+  // -----------------------------------------------------------------
+  if (
+    (qLower.includes('stemming') || qLower.includes('stemmer')) &&
+    !qLower.includes('difference') && !qLower.includes('vs') && !qLower.includes('versus') && !qLower.includes('compare') &&
+    !qLower.includes('lemmatiz')
+  ) {
+    const isLimitationsQuery = qLower.includes('limitation') || qLower.includes('drawback') || qLower.includes('disadvantage') || qLower.includes('weakness');
+
+    const spokenScript = isLimitationsQuery
+      ? 'The primary limitations of stemming stem from its heuristic, rule-based approach that chops off affixes without understanding dictionary definitions or grammar. This frequently leads to over-stemming, where words with completely different meanings like universe and university are truncated to the same crude root univers, and under-stemming, where related forms like alumnus and alumni fail to merge. Additionally, stemming produces non-words that cannot be displayed to end users and lacks part-of-speech context, which is why modern semantic NLP pipelines prefer lemmatization when precision is critical.'
+      : 'Stemming is a rule-based text normalization technique in Natural Language Processing that reduces words to their base root by heuristically stripping prefixes and suffixes. It operates via algorithms like the Porter or Snowball stemmer, slicing off common endings such as "-ing", "-ed", or "-s" through mechanical string manipulation without looking up definitions in a dictionary. Because it ignores grammar and part-of-speech context, the resulting root does not always form a valid linguistic word. In software engineering, stemming is heavily utilized in search engines and information retrieval pipelines to improve recall and match word variants with minimal computational overhead.';
+
+    const summary = isLimitationsQuery ? `### 1. Core Limitations of Stemming
+Stemming is a purely mechanical, rule-based heuristic that truncates word affixes without morphological dictionaries or part-of-speech (POS) understanding. This introduces four primary engineering limitations:
+
+1. **Over-Stemming (False Positives):** Words with entirely distinct semantic meanings are truncated to the exact same stem, falsely conflating their index.
+   - Example: *"universe"*, *"university"*, and *"universal"* are all truncated to \`"univers"\`.
+   - Impact: Degrades search precision and produces irrelevant search hits.
+
+2. **Under-Stemming (False Negatives):** Words sharing the same conceptual lemma fail to be recognized as variants because their morphological endings do not match basic heuristic rules.
+   - Example: *"alumnus"*, *"alumni"*, and *"alumnae"* do not get reduced to a common root.
+   - Impact: Reduces search recall for irregular or Latin/Greek roots.
+
+3. **Generation of Invalid Dictionary Non-Words:**
+   - Stems like \`"studi"\` (from *studies*), \`"relat"\` (from *relation*), and \`"car"\` (from *caring*) are not actual English words.
+   - Impact: Stems cannot be rendered directly in user-facing UI or generative summaries.
+
+4. **Lack of Part-of-Speech & Context Awareness:**
+   - Words like *"leaves"* (plural noun for foliage vs. 3rd-person verb for departing) are treated identically as \`"leav"\`.
+
+---
+
+### 2. Code Demonstration (Over-stemming vs Under-stemming in Python)
+\`\`\`python
+from nltk.stem import PorterStemmer
+
+stemmer = PorterStemmer()
+
+# Over-stemming example: Conflates unrelated concepts
+words_over = ["universe", "university", "universal"]
+print("Over-stemming:", [stemmer.stem(w) for w in words_over])
+# Output: ['univers', 'univers', 'univers']
+
+# Under-stemming example: Fails to conflate irregular variants
+words_under = ["alumnus", "alumni", "alumnae"]
+print("Under-stemming:", [stemmer.stem(w) for w in words_under])
+# Output: ['alumnu', 'alumni', 'alumna']
+\`\`\`
+
+---
+
+### 3. Industry Recommendations & Modern Alternatives
+- **When to Accept Limitations:** High-throughput inverted index creation (Elasticsearch/Lucene) where O(1) CPU speed outweighs strict linguistic perfection.
+- **When to Upgrade to Lemmatization:** Semantic search, customer sentiment analysis, conversational AI, and LLM Retrieval-Augmented Generation (RAG) where part-of-speech context and valid lemmas are required.`
+    : `### 1. Definition & Core Objective
+**Stemming** is an algorithmic, rule-based text normalization technique in Natural Language Processing (NLP) and Information Retrieval (IR). Its primary objective is mapping morphological variants of a word to a common root or base form (the stem) by lopping off affixes.
+
+---
+
+### 2. How Stemming Works Internally
+Stemmers execute sequential heuristic string substitution rules without accessing a lexicon:
+1. **Suffix Stripping:** Transforms plurals (*"cats"* -> *"cat"*) and verbal inflections (*"walking"* -> *"walk"*).
+2. **Rule Cascades:** Algorithms like the **Porter Stemmer** (1980) and **Snowball Stemmer** apply multi-phase rewrite rules based on consonant-vowel transitions.
+3. **No Dictionary Lookup:** Purely deterministic string manipulation, executing in sub-microsecond time per word.
+
+---
+
+### 3. Code Implementation (Python / NLTK)
+\`\`\`python
+from nltk.stem import PorterStemmer, SnowballStemmer
+
+porter = PorterStemmer()
+snowball = SnowballStemmer("english")
+
+tokens = ["connect", "connection", "connected", "connecting", "connections"]
+
+print("Porter:  ", [porter.stem(w) for w in tokens])
+print("Snowball:", [snowball.stem(w) for w in tokens])
+# Both Output: ['connect', 'connect', 'connect', 'connect', 'connect']
+\`\`\`
+
+---
+
+### 4. Key Limitations & Trade-offs
+- **Over-Stemming:** Truncating distinct words to the same stem (e.g. *"organization"* and *"organ"* -> \`"organ"\`).
+- **Under-Stemming:** Failing to connect morphological relatives (e.g. *"adhere"* and *"adhesion"*).
+- **Non-Words:** Outputting strings like \`"studi"\` which are invalid in user-facing applications.`;
+
+    return {
+      id,
+      question: prompt,
+      mode: 'general',
+      directAnswer: spokenScript,
+      summary,
+      spokenScript,
+      bullets: [
+        'Definition: Rule-based NLP preprocessing technique that strips affixes to map words to a common root.',
+        'Working Mechanism: Heuristic suffix stripping (Porter, Snowball) without dictionary lookups.',
+        'Core Limitations: Over-stemming (conflating distinct words) and under-stemming (failing to conflate relatives).',
+        'Trade-offs: Ultra-fast sub-microsecond execution speed, but produces non-words and lacks grammatical POS context.'
+      ],
+      codeSnippet: {
+        language: 'python',
+        code: `from nltk.stem import PorterStemmer\n\nstemmer = PorterStemmer()\nwords = ["running", "caring", "studies", "better"]\nprint([stemmer.stem(w) for w in words])\n# Output: ['run', 'car', 'studi', 'better']`,
+        explanation: 'Demonstrates PorterStemmer heuristic suffix stripping on regular and irregular English words.'
+      },
+      timestamp: Date.now()
+    };
+  }
+
+  // -----------------------------------------------------------------
+  // Sentiment Analysis in NLP
+  // -----------------------------------------------------------------
+  if (
+    (qLower.includes('sentiment analysis') || qLower.includes('sentiment classification')) &&
+    !qLower.includes('difference') && !qLower.includes('vs') && !qLower.includes('versus') && !qLower.includes('compare')
+  ) {
+    const spokenScript = 'Sentiment analysis is a Natural Language Processing and machine learning technique used to systematically identify, extract, and quantify emotional tone and subjective opinion from text. It typically classifies text into polarity categories such as positive, negative, or neutral, or scores it along continuous emotional dimensions. Modern implementations range from rule-based lexicon systems like VADER to fine-tuned transformer models like BERT and RoBERTa. In enterprise software, sentiment analysis powers automated customer feedback monitoring, social media brand tracking, and support ticket prioritization.';
+
+    const summary = `### 1. Definition & Core Objective
+**Sentiment Analysis** (also known as opinion mining) is an NLP and text analysis technique that extracts subjective information, polarity (positive, negative, neutral), and emotional valence from natural language text.
+
+---
+
+### 2. Architectural Approaches
+Modern systems employ three primary architectures:
+1. **Lexicon-Based (Rule-Based):**
+   - Uses pre-compiled sentiment lexicons (e.g., VADER, SentiWordNet) with assigned polarity weights.
+   - Fast, requires zero training data, and excels on social media text with emojis and slang.
+2. **Supervised Machine Learning:**
+   - Uses TF-IDF or Bag of Words features with classifiers like Logistic Regression, Naive Bayes, or Support Vector Machines.
+3. **Transformer & Deep Learning Models:**
+   - Fine-tuned contextual transformer architectures (e.g., BERT, RoBERTa, DistilBERT) that capture bidirectional syntax, negation, and complex contextual nuances.
+
+---
+
+### 3. Code Implementation (Python / VADER & Transformers)
+\`\`\`python
+# Example 1: VADER Rule-Based Sentiment Analysis
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+sia = SentimentIntensityAnalyzer()
+reviews = [
+    "The new API response time is remarkably fast and intuitive!",
+    "Database connection pool timed out under minimal load, very disappointing."
+]
+
+for review in reviews:
+    scores = sia.polarity_scores(review)
+    sentiment = "POSITIVE" if scores['compound'] >= 0.05 else "NEGATIVE" if scores['compound'] <= -0.05 else "NEUTRAL"
+    print(f"{sentiment:8} (compound: {scores['compound']:+.2f}) -> {review}")
+\`\`\`
+
+---
+
+### 4. Key Engineering Challenges
+- **Sarcasm and Irony:** Literal positive words expressing negative sentiment (*"Oh great, another server crash"*).
+- **Negation Handling:** Shifting polarity across clauses (*"The UI is not bad, but latency is unacceptable"*).
+- **Domain Specificity:** Words with positive connotations in financial domains (*"bullish", "yield"*) vs biomedical domains.`;
+
+    return {
+      id,
+      question: prompt,
+      mode: 'general',
+      directAnswer: spokenScript,
+      summary,
+      spokenScript,
+      bullets: [
+        'Definition: NLP technique that identifies, extracts, and quantifies subjective emotional tone and polarity.',
+        'Methodologies: Lexicon-based (VADER), Supervised ML (TF-IDF + SVM), and Contextual Transformers (BERT).',
+        'Industry Applications: Customer feedback analysis, social listening, support ticket routing, and review aggregation.',
+        'Core Challenges: Sarcasm detection, clause negation, and cross-domain semantic drift.'
+      ],
+      codeSnippet: {
+        language: 'python',
+        code: `from nltk.sentiment.vader import SentimentIntensityAnalyzer\n\nsia = SentimentIntensityAnalyzer()\nscore = sia.polarity_scores("The platform is exceptionally reliable and fast!")\nprint(score['compound']) # Output: 0.7717 (Positive)`,
+        explanation: 'Uses VADER sentiment analyzer to compute compound polarity score between -1.0 and +1.0.'
+      },
+      timestamp: Date.now()
+    };
+  }
+
+  // -----------------------------------------------------------------
+  // REST API Constraints & Statelessness Follow-up
+  // -----------------------------------------------------------------
+  if (
+    (qLower.includes('statelessness') || qLower.includes('stateless')) &&
+    (qLower.includes('rest') || qLower.includes('api') || qLower.includes('example'))
+  ) {
+    const spokenScript = 'In a REST API, statelessness means that each client request must contain all the information necessary for the server to understand and process it, without the server storing any client session context between requests. The server does not maintain server-side session state or memory of previous interactions, meaning authentication credentials like JWT tokens or API keys must be sent with every single request. This architectural constraint dramatically simplifies server design, eliminates server-side session synchronization, and allows modern distributed systems to scale horizontally behind a load balancer without sticky sessions.';
+
+    const summary = `### 1. Definition & Core Principle
+**Statelessness** is one of the fundamental architectural constraints defined by Roy Fielding for Representational State Transfer (REST). It dictates that:
+- Every client request to the server must contain **all contextual data, credentials, and parameters** required to fulfill the request.
+- The server never stores client session state on its local memory, disk, or sticky server-side sessions between requests.
+- Session state is entirely held and managed on the **client side**.
+
+---
+
+### 2. Benefits of Stateless Architecture
+1. **Horizontal Scalability:** Any application server behind a round-robin load balancer can fulfill any request without needing sticky sessions or distributed session replication.
+2. **Reliability & Fault Tolerance:** If an individual server crashes mid-session, adjacent servers can seamlessly process subsequent requests because no session data was trapped on the failed node.
+3. **Simplicity & Monitoring:** Each HTTP request is self-contained and idempotent or atomic, simplifying debugging, telemetry, and distributed tracing.
+
+---
+
+### 3. Real-World Code Example (Stateless JWT Authentication in Spring Boot)
+\`\`\`java
+// Client sends authorization token in the standard HTTP Authorization header:
+// GET /api/v1/orders HTTP/1.1
+// Host: api.enterprise.com
+// Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+@RestController
+@RequestMapping("/api/v1/orders")
+public class OrderController {
+
+    @GetMapping
+    public ResponseEntity<List<Order>> getUserOrders(
+            @RequestHeader(name = "Authorization") String authHeader
+    ) {
+        // 1. Validate JWT token signature and extract user claims statelessly
+        String jwtToken = authHeader.replace("Bearer ", "");
+        String userId = JwtTokenUtil.extractUserId(jwtToken);
+        
+        // 2. Process request without relying on any HttpSession state on the server
+        List<Order> orders = orderService.getOrdersForUser(userId);
+        return ResponseEntity.ok(orders);
+    }
+}
+\`\`\`
+
+---
+
+### 4. Trade-offs
+- **Payload Overhead:** Sending authentication headers (e.g., JWT tokens) on every HTTP request increases network bandwidth usage slightly.
+- **Token Revocation Complexity:** Because the server does not track active sessions in memory, blacklisting or revoking compromised tokens before expiration requires a distributed revocation cache (like Redis) or short-lived access tokens with refresh tokens.`;
+
+    return {
+      id,
+      question: prompt,
+      mode: 'general',
+      directAnswer: spokenScript,
+      summary,
+      spokenScript,
+      bullets: [
+        'Definition: REST constraint where every client request contains all necessary data and credentials to execute.',
+        'Server Design: Server holds zero client session state; no HttpSession or server-side memory between requests.',
+        'Scalability Impact: Enables seamless horizontal scaling across load-balanced nodes without sticky sessions.',
+        'Implementation: Stateless JWT Bearer tokens passed in the HTTP Authorization header.'
+      ],
+      codeSnippet: {
+        language: 'java',
+        code: `@GetMapping("/profile")\npublic ResponseEntity<UserProfile> getProfile(@RequestHeader("Authorization") String auth) {\n    String token = auth.replace("Bearer ", "");\n    String userId = jwtValidator.getUserId(token);\n    return ResponseEntity.ok(userService.find(userId));\n}`,
+        explanation: 'Stateless REST endpoint verifying JWT on every request without maintaining server-side session state.'
+      },
+      timestamp: Date.now()
+    };
+  }
+
+  if (
+    (qLower.includes('constraint') || qLower.includes('constraints')) &&
+    (qLower.includes('rest') || qLower.includes('api') || qLower.includes('its constraint') || qLower.includes('fielding') || qLower.includes('architectural constraint'))
+  ) {
+    const spokenScript = 'A REST API is defined by six architectural constraints formalized by Roy Fielding: Client-Server architecture, Statelessness, Cacheability, Uniform Interface, Layered System, and optionally Code on Demand. Client-Server separates user interface concerns from data storage; Statelessness ensures every request contains complete context without server-side sessions; Cacheability allows responses to be explicitly marked cacheable to reduce latency; Uniform Interface standardizes resource identification and representation; Layered System enables intermediaries like proxies and load balancers; and Code on Demand allows executable code like scripts to be transferred. Adhering to these constraints guarantees that the system achieves high scalability, loose coupling, and independent evolvability.';
+
+    const summary = `### 1. The 6 Architectural Constraints of REST
+Formulated by Roy Fielding in his 2000 doctoral dissertation, a system must conform to these constraints to be truly **RESTful**:
+
+1. **Client-Server Separation:**
+   - Separates user interface concerns (client) from data storage and business logic concerns (server).
+   - Allows clients and servers to evolve independently across platforms (web, mobile, IoT).
+
+2. **Statelessness:**
+   - The server stores no client session context between requests.
+   - Every request from client to server must contain all information required to understand and fulfill the request.
+
+3. **Cacheability:**
+   - Responses must explicitly define whether they are cacheable or non-cacheable (via \`Cache-Control\` and \`ETag\` headers).
+   - Prevents clients from fetching stale data while reducing server load and network latency.
+
+4. **Uniform Interface (Core Differentiator):**
+   - **Identification of Resources:** Resources are identified using standard URIs (e.g., \`/api/v1/users/42\`).
+   - **Manipulation through Representations:** Clients manipulate resources using JSON or XML representations.
+   - **Self-descriptive Messages:** Messages include MIME types and HTTP verbs (\`GET\`, \`POST\`, \`PUT\`, \`DELETE\`).
+   - **HATEOAS (Hypermedia As The Engine Of Application State):** Responses contain hypermedia links to valid next actions.
+
+5. **Layered System:**
+   - Architecture can be composed of hierarchical layers (proxies, API gateways, load balancers, caching layers).
+   - Neither client nor server knows whether it is communicating directly with the end node or an intermediary.
+
+6. **Code on Demand (Optional):**
+   - Servers can temporarily extend client functionality by transferring executable code (e.g., JavaScript scripts or WebAssembly).
+
+---
+
+### 2. Tabular Comparison of REST Constraints
+| Constraint | Core Objective | Primary Mechanism |
+| :--- | :--- | :--- |
+| **Client-Server** | Separation of concerns | Independent UI vs Data tiers |
+| **Stateless** | Horizontal scalability & fault recovery | Client holds session; JWT in headers |
+| **Cacheable** | Reduce network latency & server load | \`Cache-Control: max-age=3600\`, \`ETag\` |
+| **Uniform Interface** | Standardized, predictable interactions | HTTP Verbs, URIs, JSON representations |
+| **Layered System** | Modularity & security encapsulation | Reverse proxies, Cloudflare, API Gateways |
+| **Code on Demand** | Extensibility (Optional) | Client-side script execution |`;
+
+    return {
+      id,
+      question: prompt,
+      mode: 'general',
+      directAnswer: spokenScript,
+      summary,
+      spokenScript,
+      bullets: [
+        'Client-Server: Decouples UI clients from backend data storage services.',
+        'Stateless: No server-side session state; every request contains full context.',
+        'Cacheable: Explicit caching directives via HTTP headers to optimize bandwidth.',
+        'Uniform Interface: Standardized URI resource identifiers, HTTP methods, and representations.',
+        'Layered System: Architecture allows transparent intermediaries like proxies and gateways.'
+      ],
+      codeSnippet: {
+        language: 'http',
+        code: `HTTP/1.1 200 OK\nContent-Type: application/json\nCache-Control: public, max-age=3600\nETag: "33a64df551425fcc3532"\n\n{\n  "id": 101,\n  "status": "shipped",\n  "links": [\n    { "rel": "self", "href": "/api/orders/101" },\n    { "rel": "track", "href": "/api/orders/101/tracking" }\n  ]\n}`,
+        explanation: 'HTTP response demonstrating cacheability, uniform JSON representation, and HATEOAS hypermedia links.'
+      },
+      timestamp: Date.now()
+    };
+  }
+
+  // -----------------------------------------------------------------
   // 17. Bag of Words (BoW) in NLP
   // -----------------------------------------------------------------
   if (
@@ -2812,6 +3143,12 @@ The rate of photosynthesis follows Blackman's Principle of Limiting Factors:
 export function hasDeterministicTechnicalAnswer(prompt: string): boolean {
   const q = prompt.toLowerCase();
   return (
+    q.includes('stemming') ||
+    q.includes('stemmer') ||
+    q.includes('sentiment analysis') ||
+    q.includes('sentiment classification') ||
+    q.includes('statelessness') ||
+    (q.includes('constraint') && (q.includes('rest') || q.includes('api') || q.includes('its constraint') || q.includes('fielding'))) ||
     q.includes('bernoulli') ||
     q.includes('machine learning') ||
     q.includes('what is ml') ||

@@ -218,6 +218,14 @@ export function isKnownComparison(
     (p.includes('overload') && p.includes('overrid')))
   ) return true;
 
+  // 19. Stemming vs Lemmatization (NLP)
+  if (
+    ((cA.includes('stem') && cB.includes('lemmatiz')) ||
+    (cA.includes('lemmatiz') && cB.includes('stem')) ||
+    (p.includes('stemming') && p.includes('lemmatization')) ||
+    (p.includes('stemmer') && p.includes('lemmatizer')))
+  ) return true;
+
   return false;
 }
 
@@ -231,6 +239,16 @@ export function resolveComparisonStructure(
   const cB = (conceptB || '').toLowerCase().trim();
   const cC = (conceptC || '').toLowerCase().trim();
   const p = (fullPrompt || '').toLowerCase();
+
+  // 19. Stemming vs Lemmatization (NLP)
+  if (
+    ((cA.includes('stem') && cB.includes('lemmatiz')) ||
+    (cA.includes('lemmatiz') && cB.includes('stem')) ||
+    (p.includes('stemming') && p.includes('lemmatization')) ||
+    (p.includes('stemmer') && p.includes('lemmatizer')))
+  ) {
+    return { handlerName: 'STEMMING_VS_LEMMATIZATION', structure: getStemmingVsLemmatizationComparison() };
+  }
 
   // 1. Array vs ArrayList (Java)
   if (
@@ -480,6 +498,8 @@ export function buildCandidateComparisonAnswer(comp: ComparisonStructure): strin
     introSentence = 'In relational database design, a Primary Key and a Foreign Key are both constraints used to manage data integrity, but they serve different architectural roles.';
   } else if (cleanA.toLowerCase().includes('overload') || cleanB.toLowerCase().includes('overload')) {
     introSentence = 'Method overloading and method overriding are both fundamental object-oriented programming concepts in Java, but they serve different purposes and operate at different phases of execution.';
+  } else if (cleanA.toLowerCase().includes('stem') || cleanB.toLowerCase().includes('stem')) {
+    introSentence = 'Stemming and lemmatization are both text normalization techniques used in Natural Language Processing to reduce words to a base root, but they differ fundamentally in their algorithmic approach and linguistic accuracy.';
   } else {
     introSentence = `${cleanA} and ${cleanB} are both used in software development, but they differ in several key ways.`;
   }
@@ -512,6 +532,8 @@ export function buildCandidateComparisonAnswer(comp: ComparisonStructure): strin
     closingSentence = "That's the main difference between a process and a thread.";
   } else if (cleanA.toLowerCase().includes('overload') || cleanB.toLowerCase().includes('overload')) {
     closingSentence = "That's the main difference between method overloading and method overriding in Java.";
+  } else if (cleanA.toLowerCase().includes('stem') || cleanB.toLowerCase().includes('stem')) {
+    closingSentence = "That's the main difference between stemming and lemmatization in Natural Language Processing.";
   } else {
     closingSentence = `That's the main difference between ${cleanA} and ${cleanB}.`;
   }
@@ -2543,5 +2565,123 @@ public class OverridingDemo {
     },
     interviewSummary: 'Method overloading provides multiple ways to perform an operation within the same class using static compile-time binding, while method overriding allows a subclass to customize inherited behavior at runtime using dynamic dispatch.',
     conciseConclusion: "That's the main difference between method overloading and method overriding in Java."
+  };
+}
+
+// -----------------------------------------------------------------
+// 19. Stemming vs Lemmatization (NLP)
+// -----------------------------------------------------------------
+export function getStemmingVsLemmatizationComparison(): ComparisonStructure {
+  return {
+    conceptAName: 'Stemming',
+    conceptADefinition: 'Stemming is a rule-based text normalization technique in Natural Language Processing that reduces words to their base root (the stem) by heuristically stripping affixes (prefixes and suffixes). Operating via algorithmic rule sets like the Porter or Snowball stemmer, it chops off endings such as "-ing", "-ed", or "-s" purely through string manipulation without consulting a linguistic vocabulary or understanding grammar. Consequently, the resulting stem often does not form a valid dictionary word (for example, "caring" becomes "car", "studies" becomes "studi", and "universe" becomes "univers").',
+    conceptBName: 'Lemmatization',
+    conceptBDefinition: 'Lemmatization is a linguistically grounded morphological normalization technique in Natural Language Processing that reduces inflected word variants to their canonical dictionary base form, known as a lemma. It relies on a complete lexical dictionary and morphological analysis, taking into account the word\'s grammatical context and part of speech (POS). Because it understands morphology, it correctly maps irregular forms to their true root (for example, "better" becomes "good", "caring" becomes "care", and "studies" becomes "study"), guaranteeing that every output is a valid dictionary word.',
+    tableRows: [
+      {
+        dimension: 'Underlying Algorithm',
+        conceptAValue: 'Heuristic rule-based suffix removal (Porter, Snowball stemmer)',
+        conceptBValue: 'Lexical vocabulary lookup and morphological POS analysis (WordNet, spaCy)'
+      },
+      {
+        dimension: 'Output Validity',
+        conceptAValue: 'Crude word fragments or non-words (e.g., "studi", "univers")',
+        conceptBValue: 'Always a valid, meaningful dictionary word (lemma)'
+      },
+      {
+        dimension: 'Context & Part of Speech',
+        conceptAValue: 'Zero context or POS awareness; processes each token in isolation',
+        conceptBValue: 'Context-aware; disambiguates meaning based on POS tag (noun vs verb)'
+      },
+      {
+        dimension: 'Performance & Speed',
+        conceptAValue: 'Extremely fast, O(1) lightweight string slicing with negligible memory footprint',
+        conceptBValue: 'Computationally heavier and slower due to dictionary queries and POS tagging'
+      },
+      {
+        dimension: 'Handling of Irregular Words',
+        conceptAValue: 'Fails on irregular inflections (e.g., "better" remains "better", "went" remains "went")',
+        conceptBValue: 'Accurately maps irregular forms to canonical roots (e.g., "better" -> "good", "went" -> "go")'
+      },
+      {
+        dimension: 'Primary Industry Use Cases',
+        conceptAValue: 'Search engine indexing, inverted indices, high-volume spam detection',
+        conceptBValue: 'Sentiment analysis, machine translation, conversational AI, semantic QA'
+      }
+    ],
+    differencesInSentences: [
+      {
+        label: 'Algorithmic Approach',
+        explanation: 'Stemming operates via heuristic, rule-based suffix truncation algorithms like Porter or Snowball without grammatical awareness, whereas lemmatization uses a comprehensive lexical vocabulary and morphological analysis.'
+      },
+      {
+        label: 'Output Validity',
+        explanation: 'Stemming often produces crude fragments and non-words such as "studi" or "univers", whereas lemmatization always produces a linguistically valid dictionary word (lemma).'
+      },
+      {
+        label: 'Context and Part of Speech Awareness',
+        explanation: 'Stemming treats each word in isolation without knowing its grammatical function, whereas lemmatization uses part-of-speech tagging to disambiguate words like "meeting" as a noun versus a verb.'
+      },
+      {
+        label: 'Handling of Irregular Inflections',
+        explanation: 'Stemming cannot handle irregular grammatical forms such as "better" or "went", whereas lemmatization correctly resolves them to their dictionary roots "good" and "go".'
+      },
+      {
+        label: 'Execution Speed and Resource Footprint',
+        explanation: 'Stemming is significantly faster and computationally lightweight because it only performs string slicing, whereas lemmatization incurs higher latency and memory overhead from dictionary queries.'
+      },
+      {
+        label: 'Practical Use Cases',
+        explanation: 'Stemming is preferred in high-throughput search engines and information retrieval where indexing speed outweighs grammar, whereas lemmatization is standard in semantic search, sentiment classification, and LLM text preprocessing.'
+      }
+    ],
+    exampleA: {
+      language: 'python',
+      code: `from nltk.stem import PorterStemmer
+
+stemmer = PorterStemmer()
+words = ["caring", "running", "better", "studies", "universal"]
+stemmed = [stemmer.stem(w) for w in words]
+
+for word, stem in zip(words, stemmed):
+    print(f"{word:10} -> {stem}")`,
+      expectedOutput: `caring     -> car
+running    -> run
+better     -> better
+studies    -> studi
+universal  -> univers`,
+      explanation: 'Notice that PorterStemmer mechanically truncates affixes, converting "caring" to "car" and "studies" to the non-word "studi", while leaving the irregular word "better" unmapped.'
+    },
+    exampleB: {
+      language: 'python',
+      code: `from nltk.stem import WordNetLemmatizer
+from nltk.corpus import wordnet
+
+lemmatizer = WordNetLemmatizer()
+samples = [
+    ("caring", wordnet.VERB),
+    ("running", wordnet.VERB),
+    ("better", wordnet.ADJ),
+    ("studies", wordnet.NOUN),
+    ("universal", wordnet.ADJ)
+]
+
+for word, pos in samples:
+    lemma = lemmatizer.lemmatize(word, pos=pos)
+    print(f"{word:10} ({pos}) -> {lemma}")`,
+      expectedOutput: `caring     (v) -> care
+running    (v) -> run
+better     (a) -> good
+studies    (n) -> study
+universal  (a) -> universal`,
+      explanation: 'WordNetLemmatizer uses part-of-speech context and a dictionary to return valid linguistic roots: "caring" becomes "care", "studies" becomes "study", and "better" correctly maps to "good".'
+    },
+    useCasesAndTradeoffs: {
+      whenToUseA: 'Use Stemming in large-scale search engines, inverted index creation, and high-throughput text classification where computational speed and low memory usage are paramount and crude stems are acceptable.',
+      whenToUseB: 'Use Lemmatization in semantic analysis, sentiment classification, machine translation, chat interfaces, and modern NLP pipelines where grammatical validity and accurate semantic representation are critical.',
+      tradeoffsSummary: 'Stemming prioritizes raw execution speed and simplicity at the expense of linguistic accuracy, often causing over-stemming or non-words. Lemmatization delivers precise, valid dictionary lemmas but requires linguistic dictionaries, POS tagging, and greater computational resources.'
+    },
+    interviewSummary: 'Stemming and lemmatization are both text normalization methods in NLP. Stemming applies fast heuristic rules to strip affixes, frequently yielding non-words. Lemmatization applies morphological and part-of-speech analysis to return valid dictionary lemmas, trading speed for accuracy.',
+    conciseConclusion: "That's the main difference between stemming and lemmatization in Natural Language Processing."
   };
 }

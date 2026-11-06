@@ -19,7 +19,7 @@ import { validateTechnicalAnswer, validateFactualClaims } from '@/lib/answerVali
 import { normalizeTechnicalTerms, resolveGitCanonicalConcept } from '@/lib/technicalTermNormalizer';
 import { INITIAL_USER_PROFILE, INITIAL_PROJECTS } from '@/lib/storage';
 import { AnswerMode, CopilotAnswer } from '@/lib/types';
-import { QuestionCategory, classifyUtterance, isQuestionReadyForAnswer } from '@/lib/questionClassifier';
+import { QuestionCategory, classifyUtterance, isQuestionReadyForAnswer, detectFollowUpReference, extractConceptFromQuestion } from '@/lib/questionClassifier';
 
 interface CopilotRequestBody {
   prompt: string;
@@ -32,7 +32,17 @@ interface CopilotRequestBody {
   jobDescription?: string;
   stream?: boolean;
   category?: QuestionCategory;
-  contextHistory?: Array<{ question: string; summary: string }>;
+  contextHistory?: Array<{ 
+    id?: string;
+    utteranceId?: string;
+    question: string; 
+    summary?: string; 
+    concept?: string; 
+    timestamp?: number;
+    category?: QuestionCategory;
+  }>;
+  requestId?: number;
+  utteranceId?: string;
   temperature?: number;
   maxTokens?: number;
   interviewLanguage?: string;
@@ -421,8 +431,20 @@ export async function POST(req: NextRequest) {
       ? (prompt.split('Interviewer follow-up question:')[1]?.replace(/^[\s":]+|[\s":]+$/g, '') || prompt)
       : prompt;
 
+    const contextTurns = (body.contextHistory || []).map((h: any) => ({
+      id: h.id,
+      utteranceId: h.utteranceId,
+      question: h.question,
+      summary: h.summary || '',
+      concept: h.concept || extractConceptFromQuestion(h.question),
+      category: (h.category || 'GENERAL') as QuestionCategory,
+      timestamp: typeof h.timestamp === 'number' ? h.timestamp : Date.now(),
+      keywords: h.keywords || []
+    }));
+
     // Speech-to-Text Normalization & Anti-Hallucination Guard on Unrecognized Terms (Requirement 4 & 5)
-    const termResult = normalizeTechnicalTerms(actualQuery);
+    // Pass contextTurns so context-aware acoustic recovery (e.g. "limitation" -> "lemmatization" in stemming context) is applied
+    const termResult = normalizeTechnicalTerms(actualQuery, contextTurns);
     if (termResult.hasUnknownSuspectTerm && termResult.suggestedClarification) {
       return NextResponse.json({
         answer: {
@@ -445,13 +467,7 @@ export async function POST(req: NextRequest) {
     }
 
     const cleanQuery = termResult.normalizedText || actualQuery;
-
-    const contextTurns = (body.contextHistory || []).map((h: any) => ({
-      question: h.question,
-      summary: h.summary || '',
-      category: 'GENERAL' as QuestionCategory,
-      timestamp: Date.now()
-    }));
+    const followUpCheck = contextTurns.length > 0 ? detectFollowUpReference(cleanQuery, contextTurns[0]) : null;
 
     const readiness = isQuestionReadyForAnswer(cleanQuery, contextTurns);
     if (!readiness.isReady) {
@@ -533,13 +549,20 @@ export async function POST(req: NextRequest) {
     } else if (hasDeterministicTechnicalAnswer(cleanQuery)) {
       const techAns = generateTechnicalAnswer(cleanQuery);
       retrievedKnowledge = techAns?.spokenScript || techAns?.summary || null;
+    } else if (followUpCheck?.isFollowUp && followUpCheck.resolvedPrompt && hasDeterministicTechnicalAnswer(followUpCheck.resolvedPrompt)) {
+      const techAns = generateTechnicalAnswer(followUpCheck.resolvedPrompt);
+      retrievedKnowledge = techAns?.spokenScript || techAns?.summary || null;
     }
 
     const effectiveProvider = provider || (groqKey ? 'groq' : openAiKey ? 'openai' : anthropicKey ? 'anthropic' : 'ollama');
     const effectiveModel = model || (effectiveProvider === 'ollama' ? (process.env.OLLAMA_MODEL || 'qwen2.5:3b') : 'default');
 
     console.log('[Copilot Execution Pipeline Diagnostic]', {
+      utteranceId: (body as any).utteranceId || 'unknown',
+      requestId: (body as any).requestId || 'unknown',
       normalizedQuestion: cleanQuery,
+      isFollowUp: Boolean(followUpCheck?.isFollowUp),
+      selectedContext: followUpCheck?.parentConcept || null,
       extractedConcepts: intentResult.extractedConcepts || null,
       canonicalGitConcepts: {
         conceptA: gitConceptA,
@@ -580,11 +603,15 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 0B. Instant Zero-Latency Technical & DSA Knowledge Interceptor (Tests A, C)
-    if (intentResult.intent === 'DSA_PROBLEM' || intentResult.intent === 'CONCEPT_EXPLANATION' || intentResult.intent === 'GENERAL_TECHNICAL') {
-      const isKnownTech = hasDeterministicTechnicalAnswer(cleanQuery);
+    // 0B. Instant Zero-Latency Technical & DSA Knowledge Interceptor (Tests A, C, & Follow-ups)
+    if (intentResult.intent === 'DSA_PROBLEM' || intentResult.intent === 'CONCEPT_EXPLANATION' || intentResult.intent === 'GENERAL_TECHNICAL' || intentResult.intent === 'FOLLOW_UP') {
+      const targetQuery = (followUpCheck?.isFollowUp && followUpCheck.resolvedPrompt && hasDeterministicTechnicalAnswer(followUpCheck.resolvedPrompt))
+        ? followUpCheck.resolvedPrompt
+        : cleanQuery;
+
+      const isKnownTech = hasDeterministicTechnicalAnswer(targetQuery);
       if (shouldInterceptDeterministic || (isKnownTech && !provider)) {
-        const techAns = generateTechnicalAnswer(cleanQuery);
+        const techAns = generateTechnicalAnswer(targetQuery);
         if (techAns) {
           const validated = validateTechnicalAnswer(cleanQuery, techAns, intentResult.intent);
           if (stream) {

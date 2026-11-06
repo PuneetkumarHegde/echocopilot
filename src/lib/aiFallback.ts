@@ -5,7 +5,8 @@ import {
   isDualConceptComparison, 
   ConversationTurnSummary,
   extractQuestionAndContext,
-  splitUtteranceSentences
+  splitUtteranceSentences,
+  detectFollowUpReference
 } from './questionClassifier';
 import { normalizeTechnicalTerms } from './technicalTermNormalizer';
 import { classifyQuestionIntent } from './intentClassifier';
@@ -446,7 +447,7 @@ Your answers must sound like a knowledgeable candidate explaining a concept to a
  */
 export function buildInterviewAssistantPrompt(
   question: string,
-  contextHistory?: Array<{ question: string; summary: string }>,
+  contextHistory?: Array<{ question: string; summary: string; timestamp?: number; concept?: string } | ConversationTurnSummary>,
   configuredLanguage: string = 'Java'
 ): { systemPrompt: string; userPrompt: string } {
   const cleanQ = question.trim();
@@ -469,9 +470,16 @@ export function buildInterviewAssistantPrompt(
   } else if (contextHistory && contextHistory.length > 0) {
     // If question is a contextual follow-up, include immediate parent turn so the model knows context
     const parent = contextHistory[0];
+    const parentSummary: ConversationTurnSummary = {
+      question: parent.question,
+      summary: parent.summary || '',
+      timestamp: (parent as any).timestamp || Date.now(),
+      concept: (parent as any).concept
+    };
+    const followUp = detectFollowUpReference(cleanQ, parentSummary);
     const isFollowUpPattern = /^(explain that|why\??|how come\??|which one|which should i use|give (a |an )?(small )?code|show code|what about|could you elaborate|can you elaborate|what is the (time |space )?complexity|how does that work|does it shrink|does its capacity shrink)\b/i.test(cleanQ);
-    if (isFollowUpPattern || cleanQ.split(/\s+/).length <= 6) {
-      userPrompt = `Previous context:\nQuestion: "${parent.question}"\nAnswer summary: "${parent.summary}"\n\nFollow-up question: "${cleanQ}"`;
+    if (followUp.isFollowUp || isFollowUpPattern || cleanQ.split(/\s+/).length <= 6) {
+      userPrompt = `Previous context:\nQuestion: "${parent.question}"\nActive concept: "${followUp.parentConcept || (parent as any).concept || parent.question}"\nAnswer summary: "${parent.summary || parent.question}"\n\nFollow-up question: "${cleanQ}"`;
     }
   }
 
